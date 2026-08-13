@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0B0D12">
+<title>AS Suite</title>
+<meta name="description" content="Tareas, finanzas, contenido y lectura. Un solo lugar.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;800;900&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ink:#0B0D12;
+  --panel:#141821;
+  --panel-2:#1B2130;
+  --line:#28303F;
+  --txt:#EEF1F6;
+  --mut:#8794A8;
+
+  /* Canales — un color por app */
+  --ch-tasks:#FFB020;
+  --ch-money:#3DDC91;
+  --ch-social:#FF5CA8;
+  --ch-read:#8B7CFF;
+
+  --display:'Archivo',system-ui,sans-serif;
+  --mono:'IBM Plex Mono',ui-monospace,monospace;
+  --body:'Inter',system-ui,sans-serif;
+}
+
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;background:var(--ink);color:var(--txt);
+  font-family:var(--body);line-height:1.5;
+  overflow-x:hidden;
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(139,124,255,.10), transparent 70%),
+    repeating-linear-gradient(180deg, rgba(255,255,255,.013) 0 1px, transparent 1px 3px);
+}
+a{color:inherit;text-decoration:none}
+:focus-visible{outline:2px solid var(--ch-read);outline-offset:3px;border-radius:4px}
+
+.wrap{max-width:1120px;margin:0 auto;padding:0 20px}
+
+/* ---------- Barra de estado ---------- */
+.statusbar{
+  border-bottom:1px solid var(--line);
+  background:rgba(11,13,18,.85);
+  backdrop-filter:blur(10px);
+  position:sticky;top:0;z-index:20;
+}
+.statusbar .wrap{
+  display:flex;align-items:center;justify-content:space-between;
+  gap:16px;height:52px;
+}
+.mark{
+  font-family:var(--display);font-weight:900;font-size:1.05rem;
+  letter-spacing:.06em;display:flex;align-items:center;gap:8px;
+}
+.mark i{
+  font-style:normal;color:var(--ink);background:var(--txt);
+  padding:2px 6px;border-radius:3px;font-size:.85rem;
+}
+.sysline{
+  font-family:var(--mono);font-size:.7rem;color:var(--mut);
+  letter-spacing:.1em;text-transform:uppercase;
+  display:flex;align-items:center;gap:8px;
+}
+.dot{
+  width:6px;height:6px;border-radius:50%;background:var(--ch-money);
+  box-shadow:0 0 0 0 rgba(61,220,145,.6);
+  animation:pulse 2.6s ease-out infinite;
+}
+@keyframes pulse{
+  0%{box-shadow:0 0 0 0 rgba(61,220,145,.5)}
+  70%{box-shadow:0 0 0 7px rgba(61,220,145,0)}
+  100%{box-shadow:0 0 0 0 rgba(61,220,145,0)}
+}
+
+/* ---------- Hero ---------- */
+.hero{padding:64px 0 40px}
+.eyebrow{
+  font-family:var(--mono);font-size:.72rem;letter-spacing:.22em;
+  text-transform:uppercase;color:var(--mut);margin-bottom:20px;
+}
+.hero h1{
+  font-family:var(--display);font-weight:900;
+  font-size:clamp(2.6rem,10vw,5.4rem);
+  line-height:.92;letter-spacing:-.03em;margin:0 0 22px;
+  text-wrap:balance;
+}
+.hero h1 em{
+  font-style:normal;
+  background:linear-gradient(100deg,var(--ch-tasks),var(--ch-social) 45%,var(--ch-read));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.hero p{
+  max-width:44ch;color:var(--mut);font-size:1.02rem;margin:0;
+}
+
+/* Cinta divisoria */
+.ticker{
+  margin:44px 0 0;border-block:1px solid var(--line);
+  overflow:hidden;padding:9px 0;
+  -webkit-mask-image:linear-gradient(90deg,transparent,#000 8%,#000 92%,transparent);
+          mask-image:linear-gradient(90deg,transparent,#000 8%,#000 92%,transparent);
+}
+.ticker div{
+  display:inline-flex;gap:34px;white-space:nowrap;
+  font-family:var(--mono);font-size:.72rem;letter-spacing:.18em;
+  text-transform:uppercase;color:var(--mut);
+  animation:slide 34s linear infinite;
+}
+.ticker span{display:inline-flex;gap:34px}
+@keyframes slide{to{transform:translateX(-50%)}}
+
+/* ---------- Canales ---------- */
+.section-head{
+  display:flex;align-items:baseline;justify-content:space-between;
+  gap:16px;margin:56px 0 20px;flex-wrap:wrap;
+}
+.section-head h2{
+  font-family:var(--display);font-weight:800;font-size:1.5rem;
+  letter-spacing:-.01em;margin:0;
+}
+.section-head .note{
+  font-family:var(--mono);font-size:.7rem;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--mut);
+}
+
+.channels{
+  display:grid;gap:14px;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+}
+.channel{
+  --c:var(--ch-tasks);
+  position:relative;display:block;overflow:hidden;
+  background:var(--panel);border:1px solid var(--line);
+  border-radius:14px;padding:22px 20px 20px;
+  transition:border-color .25s, transform .25s, background .25s;
+}
+.channel::before{
+  content:"";position:absolute;inset:0 auto 0 0;width:3px;
+  background:var(--c);opacity:.5;transition:opacity .25s;
+}
+.channel::after{
+  content:"";position:absolute;inset:0;pointer-events:none;
+  background:linear-gradient(180deg,transparent 40%,color-mix(in srgb,var(--c) 12%,transparent));
+  opacity:0;transition:opacity .3s;
+}
+.channel:hover,.channel:focus-visible{
+  border-color:color-mix(in srgb,var(--c) 45%,var(--line));
+  background:var(--panel-2);transform:translateY(-2px);
+}
+.channel:hover::before,.channel:focus-visible::before{opacity:1}
+.channel:hover::after,.channel:focus-visible::after{opacity:1}
+
+.ch-top{
+  display:flex;align-items:center;justify-content:space-between;
+  gap:12px;margin-bottom:auto;
+}
+.ch-tag{
+  font-family:var(--mono);font-size:.66rem;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--c);
+  border:1px solid color-mix(in srgb,var(--c) 35%,transparent);
+  border-radius:99px;padding:3px 9px;
+}
+.ch-arrow{
+  font-family:var(--mono);color:var(--mut);font-size:.95rem;
+  transition:transform .25s,color .25s;
+}
+.channel:hover .ch-arrow{transform:translate(3px,-3px);color:var(--c)}
+
+.channel h3{
+  font-family:var(--display);font-weight:800;
+  font-size:clamp(1.4rem,4vw,1.85rem);letter-spacing:-.02em;
+  margin:26px 0 6px;line-height:1.05;
+}
+.channel > p{color:var(--mut);font-size:.9rem;margin:0 0 18px;max-width:34ch}
+
+.ch-bits{display:flex;flex-wrap:wrap;gap:6px}
+.ch-bits b{
+  font-family:var(--mono);font-weight:500;font-size:.66rem;
+  letter-spacing:.08em;text-transform:uppercase;
+  color:var(--mut);background:rgba(255,255,255,.04);
+  border-radius:5px;padding:4px 8px;
+}
+
+/* Métrica del canal */
+.ch-metric{
+  margin-top:20px;padding-top:16px;
+  border-top:1px solid var(--line);
+  display:flex;align-items:baseline;gap:9px;
+}
+.ch-metric strong{
+  font-family:var(--display);font-weight:800;font-size:1.5rem;
+  letter-spacing:-.02em;color:var(--c);
+}
+.ch-metric span{
+  font-family:var(--mono);font-size:.68rem;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--mut);
+}
+.ch-metric.pending strong{color:var(--mut);opacity:.5}
+
+/* ---------- Cierre ---------- */
+.closing{
+  margin:72px 0 0;padding:40px 0;
+  border-top:1px solid var(--line);
+  display:flex;align-items:flex-end;justify-content:space-between;
+  gap:28px;flex-wrap:wrap;
+}
+.closing h2{
+  font-family:var(--display);font-weight:900;
+  font-size:clamp(1.6rem,5.5vw,2.6rem);line-height:1;
+  letter-spacing:-.025em;margin:0;
+}
+.closing h2 em{font-style:normal;color:var(--mut)}
+footer{
+  font-family:var(--mono);font-size:.68rem;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--mut);
+  padding-bottom:44px;
+}
+
+/* ---------- Responsive ---------- */
+@media(max-width:720px){
+  .wrap{padding:0 16px}
+  .hero{padding:44px 0 28px}
+  .channels{grid-template-columns:1fr;gap:12px}
+  .channel{padding:18px 16px 16px}
+  .channel h3{margin-top:20px}
+  .sysline .hide-sm{display:none}
+  .section-head{margin:44px 0 16px}
+  .closing{margin-top:56px;padding:32px 0}
+}
+
+@media(prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+}
+</style>
+</head>
+<body>
+
+<div class="statusbar">
+  <div class="wrap">
+    <div class="mark"><i>AS</i> SUITE</div>
+    <div class="sysline">
+      <span class="dot" aria-hidden="true"></span>
+      <span>4 canales</span>
+      <span class="hide-sm">· Medellín</span>
+    </div>
+  </div>
+</div>
+
+<main>
+  <section class="hero wrap">
+    <div class="eyebrow">Sistema personal · 2026</div>
+    <h1>Menos ruido.<br><em>Más vida.</em></h1>
+    <p>Tareas, dinero, contenido y lectura. Cada uno con su propio mundo, todos a un toque de distancia.</p>
+  </section>
+
+  <div class="ticker" aria-hidden="true">
+    <div>
+      <span>
+        Sincronizado en la nube · Hecho para el celular · Sin ruido corporativo · Datos reales, no estimados · Construido a medida ·
+      </span>
+      <span>
+        Sincronizado en la nube · Hecho para el celular · Sin ruido corporativo · Datos reales, no estimados · Construido a medida ·
+      </span>
+    </div>
+  </div>
+
+  <section class="wrap">
+    <div class="section-head">
+      <h2>Elige canal</h2>
+      <div class="note">Sintoniza uno</div>
+    </div>
+
+    <div class="channels">
+
+      <a class="channel" style="--c:var(--ch-tasks)" href="https://gestion-tareas.espacio-de-t-7328.chatgpt.site">
+        <div class="ch-top">
+          <div class="ch-tag">Organiza el caos</div>
+          <div class="ch-arrow" aria-hidden="true">↗</div>
+        </div>
+        <h3>Gestión de tareas</h3>
+        <p>Agenda, prioridades, proyectos y recordatorios en una sola matriz.</p>
+        <div class="ch-bits"><b>Inbox</b><b>Agenda</b><b>Proyectos</b><b>Post-its</b></div>
+        <div class="ch-metric pending">
+          <strong>—</strong><span>Pendientes hoy</span>
+        </div>
+      </a>
+
+      <a class="channel" style="--c:var(--ch-money)" href="https://as-finanzas.espacio-de-t-7328.chatgpt.site">
+        <div class="ch-top">
+          <div class="ch-tag">Dinero sin drama</div>
+          <div class="ch-arrow" aria-hidden="true">↗</div>
+        </div>
+        <h3>Finanzas</h3>
+        <p>Movimientos, presupuesto y metas. Perfiles separados para Chori y Toli.</p>
+        <div class="ch-bits"><b>Movimientos</b><b>Presupuesto</b><b>Deudas</b><b>Metas</b></div>
+        <div class="ch-metric pending">
+          <strong>—</strong><span>Gastado este mes</span>
+        </div>
+      </a>
+
+      <a class="channel" style="--c:var(--ch-social)" href="https://as-social-studio.espacio-de-t-7328.chatgpt.site">
+        <div class="ch-top">
+          <div class="ch-tag">Planea el próximo drop</div>
+          <div class="ch-arrow" aria-hidden="true">↗</div>
+        </div>
+        <h3>Social Studio</h3>
+        <p>Estrategia, contenido y calendario, sin mezclar marcas ni cuentas.</p>
+        <div class="ch-bits"><b>Proyectos</b><b>Ideas</b><b>Borradores</b><b>Calendario</b></div>
+        <div class="ch-metric pending">
+          <strong>—</strong><span>Piezas programadas</span>
+        </div>
+      </a>
+
+      <a class="channel" style="--c:var(--ch-read)" href="https://as-reader-tracker.espacio-de-t-7328.chatgpt.site">
+        <div class="ch-top">
+          <div class="ch-tag">Lee · avanza · sube de nivel</div>
+          <div class="ch-arrow" aria-hidden="true">↗</div>
+        </div>
+        <h3>Reader Tracker</h3>
+        <p>Cada página suma XP, logros y puntos de season. App aparte, mundo propio.</p>
+        <div class="ch-bits"><b>Libros</b><b>XP</b><b>Logros</b><b>Seasons</b></div>
+        <div class="ch-metric pending">
+          <strong>—</strong><span>Páginas esta semana</span>
+        </div>
+      </a>
+
+    </div>
+  </section>
+
+  <section class="wrap">
+    <div class="closing">
+      <h2>Hecho para la<br>vida real, <em>no para una demo.</em></h2>
+    </div>
+  </section>
+</main>
+
+<footer class="wrap">AS Suite · Medellín · 2026</footer>
+
+</body>
+</html>
