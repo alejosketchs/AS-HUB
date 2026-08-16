@@ -192,6 +192,7 @@ body[data-skin="taskgrid"] .wrap{max-width:1560px}
 .tgMiniStats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}.tgMiniStats span{padding:13px;background:var(--tg-panel);border:2px solid var(--tg-ink);font:700 11px var(--mono)}.tgMiniStats b{font-size:20px}
 .tgWeekPlan,.tgCalendarSync{padding:20px;margin-top:22px;background:var(--tg-panel);border:3px solid var(--tg-ink);box-shadow:6px 6px 0 var(--tg-ink)}.tgWeekSuggestions{display:grid;grid-template-columns:repeat(7,minmax(120px,1fr));gap:8px;margin-top:16px;overflow:auto}.tgWeekSuggestions article{min-width:130px;background:var(--q4)}
 .tgCalendarSync{display:flex;align-items:center;justify-content:space-between;gap:20px;background:var(--q2)}.tgCalendarSync h3,.tgWeekPlan h3{margin-top:5px;font:1000 22px var(--sans)}.tgCalendarSync p,.tgWeekPlan p{margin-top:5px;font-size:12.5px;color:#57574f}
+.tgCalendarActions{display:flex;gap:10px;flex-wrap:wrap}.tgCalendarActions .tgBtn{white-space:nowrap}
 .tgPlanControls{display:flex;align-items:end;gap:10px;flex-wrap:wrap}.tgPlanControls label{display:grid;gap:5px;font:800 10px var(--mono)}
 .tgTaskFab{position:fixed;right:18px;bottom:calc(var(--nav-h) + var(--safe-b) + 18px);z-index:45;display:none;width:58px;height:58px;background:var(--tg-yellow);color:var(--tg-ink);border:3px solid var(--tg-ink);border-radius:50%;box-shadow:5px 5px 0 var(--tg-ink);font:1000 28px var(--mono)}
 .tgInlineCheck{display:flex;align-items:center;gap:9px;min-height:48px;font-weight:700}.tgInlineCheck input{width:20px;height:20px}

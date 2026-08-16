@@ -32,8 +32,10 @@ en toda la serie; las excepciones se guardan en `recurrence_exceptions`.
 ## Google Calendar
 
 La base incluye `external_calendar_id`, `external_event_id`, `sync_status` y
-marcas de actualización externa. La activación requiere una Edge Function o
-backend equivalente con OAuth protegido.
+marcas de actualización externa. La Edge Function `google-calendar` completa
+OAuth, cifra tokens con AES-GCM y valida la sesión propia de AS Hub antes de
+aceptar acciones. El callback valida `state` y PKCE antes de intercambiar el
+código de Google.
 
 Flujo previsto:
 
@@ -46,6 +48,20 @@ Flujo previsto:
    comparables, `sync_status = conflict` y la interfaz pide elegir.
 6. Las operaciones se vuelven idempotentes con `external_event_id`; nunca se
    duplica una tarea para representarla en el calendario.
+
+### Configuración del cliente de Google
+
+1. Habilitar Google Calendar API en Google Cloud.
+2. Crear un cliente OAuth de tipo **Web application**.
+3. Registrar exactamente este redirect URI:
+   `https://derzetuipyugmrjaxcyu.supabase.co/functions/v1/google-calendar`.
+4. Guardar `GOOGLE_CLIENT_ID` y `GOOGLE_CLIENT_SECRET` en Supabase → Edge
+   Functions → Secrets. Nunca añadirlos al repositorio o a variables públicas.
+5. Opcional: definir `GOOGLE_TOKEN_ENCRYPTION_KEY` con un secreto aleatorio de
+   al menos 32 bytes. Sin él, la función deriva la clave del secreto de servicio
+   que Supabase inyecta únicamente en el servidor.
+6. Definir `AS_HUB_ORIGIN=https://as-hub-orpin.vercel.app` si el dominio cambia;
+   este es el valor seguro por defecto de la función.
 
 ## Notificaciones
 
