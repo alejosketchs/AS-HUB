@@ -20,34 +20,23 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="preconnect" href="https://derzetuipyugmrjaxcyu.supabase.co" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400..1000&family=Geist+Mono:wght@400..900&display=swap" rel="stylesheet">
+
 <!-- Si una hoja de estilo no está en este sitio, se pide al espejo.
      Al publicar el repo completo, siempre gana la copia local. -->
 <link rel="stylesheet" href="/css/app.css" onerror="this.href='https://as-hub-mods-as24-b7b9.vercel.app/css/app.css'">
-<link rel="stylesheet" href="/css/taskgrid.css" onerror="this.href='https://as-hub-mods-as24-b7b9.vercel.app/css/taskgrid.css'">
-<link rel="stylesheet" href="/css/finance.css" onerror="this.href='https://as-hub-mods-as24-b7b9.vercel.app/css/finance.css'">
+<link rel="stylesheet" href="/css/taskgrid.css" onerror="this.href='https://as-hub-css-as24-b7b9.vercel.app/css/taskgrid.css'">
+<link rel="stylesheet" href="/css/finance.css" onerror="this.href='https://as-hub-css-as24-b7b9.vercel.app/css/finance.css'">
 </head>
 <body>
 
-<div id="lock" class="lock hide">
-  <div class="lockBox">
-    <div class="brandBubble" style="width:70px;height:62px;font-size:22px">AS!</div>
-    <h1 class="display" style="font-size:34px">AS HUB</h1>
-    <p class="muted" style="font-size:13px;font-weight:650">Ingresa tu PIN para entrar</p>
-    <div class="lockDots" id="lockDots"><i></i><i></i><i></i><i></i></div>
-    <div class="keypad" id="keypad">
-      <button type="button" data-k="1">1</button>
-      <button type="button" data-k="2">2</button>
-      <button type="button" data-k="3">3</button>
-      <button type="button" data-k="4">4</button>
-      <button type="button" data-k="5">5</button>
-      <button type="button" data-k="6">6</button>
-      <button type="button" data-k="7">7</button>
-      <button type="button" data-k="8">8</button>
-      <button type="button" data-k="9">9</button>
-      <button type="button" data-k="reset" style="background:transparent;color:var(--muted);border-color:#ffffff30;box-shadow:none;font-size:11px">RESET</button>
-      <button type="button" data-k="0">0</button>
-      <button type="button" data-k="del" style="background:transparent;color:var(--text);border-color:#ffffff30;box-shadow:none">⌫</button>
+<!-- Puerta de entrada: perfil + PIN -->
+<div id="gate" class="gate hide">
+  <div class="gateCard">
+    <div class="gateBrand">
+      <span class="brandBubble">AS!</span>
+      <div><b>AS SUITE</b><i>acceso</i></div>
     </div>
+    <div id="gateBox" class="gateBox"></div>
   </div>
 </div>
 
@@ -67,7 +56,9 @@
 
       <div class="row">
         <span class="pill" id="syncPill"><i></i><span id="syncText">SYNC</span></span>
-        <button class="iconBtn" id="btnLock" type="button" aria-label="Bloquear">🔒</button>
+        <button class="whoBtn" id="btnWho" type="button" aria-label="Sesión">
+          <span id="whoEmoji">👤</span><b id="whoName">—</b>
+        </button>
       </div>
     </div>
   </header>

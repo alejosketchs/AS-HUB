@@ -3,7 +3,7 @@
    - el "shell" (HTML, CSS, JS, íconos) se guarda en caché para abrir sin conexión
    - las peticiones a Supabase nunca se cachean (siempre datos frescos)
 */
-const VERSION = 'ashub-v2.2.0';
+const VERSION = 'ashub-v3.2.0';
 const SHELL = [
   '/',
   '/index.html',
@@ -14,7 +14,9 @@ const SHELL = [
   '/js/config.js',
   '/js/db.js',
   '/js/ui.js',
-  '/js/lock.js',
+  '/js/session.js',
+  '/js/user-settings.js',
+  '/js/cop-input.js',
   '/js/views/hub.js',
   '/js/views/tasks.js',
   '/js/views/finance.js',
