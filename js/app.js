@@ -28,6 +28,7 @@ let current = null;
 function path() {
   const raw = (location.hash || '#/').slice(1);
   const clean = raw.split('?')[0].replace(/\/$/, '') || '/';
+  if (clean.startsWith('/tareas/')) return '/tareas';
   return routes[clean] ? clean : '/';
 }
 

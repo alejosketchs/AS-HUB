@@ -5,6 +5,7 @@ const { Tasks, Projects, Notes, Agenda, watch, unwatch, readCache, writeCache } 
   await import(new URL('/js/db.js', location.origin).href);
 const { $, $$, html, raw, esc, toast, sheet, confirmSheet, todayISO, addDays } =
   await import(new URL('/js/ui.js', location.origin).href);
+const { perfilActivo } = await import(new URL('/js/session.js', location.origin).href);
 
 const svg = (d) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
   stroke-linecap="round" stroke-linejoin="round" width="19" height="19" aria-hidden="true">${d}</svg>`;
@@ -18,8 +19,8 @@ const ICONS = {
 };
 
 const SECTIONS = [
-  { id: 'tareas', icon: ICONS.grid, label: 'Tareas' },
   { id: 'hoy', icon: ICONS.today, label: 'Hoy' },
+  { id: 'tareas', icon: ICONS.grid, label: 'Tareas' },
   { id: 'agenda', icon: ICONS.week, label: 'Agenda' },
   { id: 'proyectos', icon: ICONS.folder, label: 'Proyectos' },
   { id: 'recordatorios', icon: ICONS.note, label: 'Recordatorios' },
@@ -32,7 +33,7 @@ const QUADS = {
   4: { code: 'Q4', title: 'ALGÚN DÍA', sub: 'Ni urgente ni importante', tag: 'Q4 · ALGÚN DÍA' },
 };
 
-const DURATIONS = [15, 30, 45, 60, 90, 120, 180, 240, 480];
+const DURATIONS = [30, 60, 90, 120, 150, 180, 210, 240];
 const NOTE_COLORS = ['#ffd523', '#a8ff1e', '#8bd8ff', '#ff9ecb', '#d5b8ff', '#ffb37a'];
 
 const DIAS_LARGOS = ['DOMINGO', 'LUNES', 'MARTES', 'MIÉRCOLES', 'JUEVES', 'VIERNES', 'SÁBADO'];
@@ -42,15 +43,18 @@ const MESES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio',
 
 const SLOT_H = 34;
 const DAY_START = 6;
-const DAY_END = 22;
+const DAY_END = 23;
 
 let root;
 let state = {
-  section: 'tareas',
+  section: 'hoy',
   weekStart: null,
   projectFilter: null,
   capture: { urgent: false, important: false },
   picked: null,
+  noteQuery: '',
+  preferredPeriod: localStorage.getItem('ashub:tasks:preferred-period') || 'afternoon',
+  nowTimer: null,
   tasks: [], projects: [], notes: [], events: [],
 };
 
@@ -94,7 +98,79 @@ function startOfWeek(iso) {
 }
 
 const projectOf = (id) => state.projects.find((p) => p.id === id);
-const pending = () => state.tasks.filter((t) => t.status !== 'done');
+const activeTasks = () => state.tasks.filter((t) => !t.archived_at);
+const pending = () => activeTasks().filter((t) => t.status !== 'done');
+const visibleForProfile = (row) => !row.profile_id || row.profile_id === perfilActivo()?.id;
+
+function sectionFromHash() {
+  const part = (location.hash.match(/^#\/tareas\/([^?]+)/) || [])[1];
+  if (part === 'pendientes') return 'tareas';
+  return SECTIONS.some((s) => s.id === part) ? part : 'hoy';
+}
+
+const routeFor = (section) => `#/tareas/${section === 'tareas' ? 'pendientes' : section}`;
+
+function daysUntil(iso) {
+  if (!iso) return 999;
+  return Math.round((dateAt(iso) - dateAt(todayISO())) / 864e5);
+}
+
+function taskScore(t) {
+  const q = quadOf(t) || 4;
+  const base = { 1: 600, 2: 400, 3: 200, 4: 100 }[q];
+  const left = daysUntil(t.due_date);
+  const due = left < 0 ? 260 : left === 0 ? 190 : left === 1 ? 140 : left <= 3 ? 80 : 0;
+  return base + due - Math.min(60, (Number(t.duration_min) || 30) / 4);
+}
+
+function freeGaps(iso, { futureOnly = false } = {}) {
+  const busy = dayItems(iso).map((item) => ({
+    start: Math.max(DAY_START * 60, minutesOf(item.start)),
+    end: Math.min(DAY_END * 60, minutesOf(item.end)),
+  })).filter((b) => b.end > b.start).sort((a, b) => a.start - b.start);
+  const now = new Date();
+  let cursor = DAY_START * 60;
+  if (futureOnly && iso === todayISO()) cursor = Math.max(cursor, Math.ceil((now.getHours() * 60 + now.getMinutes()) / 30) * 30);
+  const gaps = [];
+  busy.forEach((block) => {
+    if (block.start > cursor) gaps.push({ start: cursor, end: block.start, minutes: block.start - cursor });
+    cursor = Math.max(cursor, block.end);
+  });
+  if (cursor < DAY_END * 60) gaps.push({ start: cursor, end: DAY_END * 60, minutes: DAY_END * 60 - cursor });
+  return gaps.filter((g) => g.minutes >= 30);
+}
+
+function suggestionsFor(iso, limit = 3) {
+  const target = state.preferredPeriod === 'morning' ? 9 * 60 : state.preferredPeriod === 'night' ? 19 * 60 : 14 * 60;
+  const gaps = freeGaps(iso, { futureOnly: true }).sort((a, b) => Math.abs(a.start - target) - Math.abs(b.start - target));
+  const unscheduled = pending().filter((t) => !t.scheduled_date && Number(t.duration_min || 30) <= 240)
+    .sort((a, b) => taskScore(b) - taskScore(a));
+  const used = new Set();
+  const suggestions = [];
+  gaps.forEach((gap) => {
+    const task = unscheduled.find((t) => !used.has(t.id) && Number(t.duration_min || 30) <= gap.minutes);
+    if (!task || suggestions.length >= limit) return;
+    used.add(task.id);
+    suggestions.push({ task, gap });
+  });
+  return { gaps, suggestions };
+}
+
+function reasonFor(t, gap) {
+  const q = quadOf(t) || 4;
+  const left = daysUntil(t.due_date);
+  const due = left < 0 ? 'está vencida' : left === 0 ? 'vence hoy' : left === 1 ? 'vence mañana' : t.due_date ? `vence en ${left} días` : 'no tiene fecha límite';
+  return `${due}, es Q${q} y cabe en tu hueco de ${fmtDuration(gap.minutes)}`;
+}
+
+function overloadForWeek() {
+  const end = addDays(todayISO(), 6);
+  const due = pending().filter((t) => t.due_date && t.due_date <= end && !t.scheduled_date);
+  const required = due.reduce((sum, t) => sum + Number(t.duration_min || 30), 0);
+  let available = 0;
+  for (let i = 0; i < 7; i += 1) available += freeGaps(addDays(todayISO(), i), { futureOnly: i === 0 }).reduce((sum, g) => sum + g.minutes, 0);
+  return { required, available, tasks: due.sort((a, b) => taskScore(b) - taskScore(a)).slice(0, 3) };
+}
 
 function statsHTML() {
   const open = pending();
@@ -117,12 +193,15 @@ function taskCardHTML(t, { draggable = false, mini = false } = {}) {
   if (t.due_date) meta.push(`LÍMITE ${t.due_date}`);
 
   const chips = [`<span class="tgChip">⏱ ${esc(fmtDuration(t.duration_min))}</span>`];
+  const elapsed = Number(t.timer_elapsed_sec || 0) + (t.timer_started_at
+    ? Math.max(0, Math.floor((Date.now() - new Date(t.timer_started_at).getTime()) / 1000)) : 0);
+  if (elapsed) chips.push(`<span class="tgChip">◷ ${esc(fmtDuration(Math.max(1, Math.round(elapsed / 60))))} real</span>`);
   if (!mini && t.scheduled_date) {
     chips.push(`<span class="tgChip">▤ ${esc(t.scheduled_date)} · ${esc(fmtTime(t.scheduled_time))}</span>`);
   }
 
   return html`
-    <article class="tgTask ${mini ? 'tgTask--mini' : ''} ${t.status === 'done' ? 'is-done' : ''} ${state.picked === t.id ? 'is-picked' : ''}"
+    <article class="tgTask ${mini ? 'tgTask--mini' : ''} ${t.status === 'done' ? 'is-done' : ''} ${state.picked?.id === t.id ? 'is-picked' : ''}"
              data-task="${t.id}" style="--qe:${q ? `var(--q${q}-edge)` : '#8a8a80'}"
              ${raw(draggable ? 'draggable="true"' : '')}>
       <div class="tgTaskTop">
@@ -130,12 +209,13 @@ function taskCardHTML(t, { draggable = false, mini = false } = {}) {
         <div class="tgTaskTitle">${t.title}</div>
         <div class="tgIcons">
           <button type="button" data-act="edit" aria-label="Editar">✎</button>
-          <button type="button" data-act="del" aria-label="Borrar">🗑</button>
+          <button type="button" data-act="timer" aria-label="${t.timer_started_at ? 'Pausar' : 'Iniciar'} temporizador">${t.timer_started_at ? 'Ⅱ' : '▶'}</button>
+          <button type="button" data-act="del" aria-label="Archivar">⌫</button>
         </div>
       </div>
       <div class="tgTaskMeta">${meta.join(' · ')}</div>
       <div class="tgChips">${raw(chips.join(''))}</div>
-      ${raw(mini ? '' : '<button class="tgLink" type="button" data-act="schedule">→ Llevar a agenda</button>')}
+      ${raw(mini ? '' : `<button class="tgLink" type="button" data-act="schedule">${t.scheduled_date ? '→ Reprogramar' : '→ Llevar a agenda'}</button>`)}
     </article>`;
 }
 
@@ -163,18 +243,6 @@ function viewTareas() {
   return html`
     ${raw(statsHTML())}
 
-    <section class="tgCapture">
-      <span>// CAPTURA + CLASIFICA</span>
-      <h3>NUEVA TAREA</h3>
-      <p>Elige urgencia e importancia; aparecerá abajo en su cuadrante.</p>
-      <form class="tgCaptureBar" id="tgCapture">
-        <input id="tgCaptureInput" placeholder="＋  ¿Qué necesitas hacer?" autocomplete="off">
-        <button class="tgFlag" type="button" data-flag="urgent" aria-pressed="${state.capture.urgent ? 'true' : 'false'}">⚡ URGENTE</button>
-        <button class="tgFlag" type="button" data-flag="important" aria-pressed="${state.capture.important ? 'true' : 'false'}">◎ IMPORTANTE</button>
-        <button class="tgBtn tgBtn--ink tgBtn--sm" type="submit">AGREGAR A LA MATRIZ</button>
-      </form>
-    </section>
-
     ${raw(filter ? `<div class="tgAxis"><b>Filtrando por ${esc(filter.emoji)} ${esc(filter.name)}</b>
       <button class="tgBtn tgBtn--plain tgBtn--sm" type="button" data-act="clearfilter">QUITAR FILTRO</button></div>` : '')}
 
@@ -193,38 +261,53 @@ function viewTareas() {
 function viewHoy() {
   const today = todayISO();
   const items = dayItems(today).sort((a, b) => minutesOf(a.start) - minutesOf(b.start));
-  const vencen = pending().filter((t) => t.due_date === today);
-  const vencidas = pending().filter((t) => t.due_date && t.due_date < today);
+  const candidates = pending().filter((t) => t.due_date === today || !t.scheduled_date || t.scheduled_date === today)
+    .sort((a, b) => taskScore(b) - taskScore(a));
+  const focus = candidates[0] || null;
+  const { gaps, suggestions } = suggestionsFor(today, 3);
+  const overload = overloadForWeek();
+  const now = new Date();
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const missed = pending().filter((t) => t.scheduled_date === today && t.scheduled_time
+    && minutesOf(t.scheduled_time.slice(0, 5)) + Number(t.duration_min || 30) < nowMin);
+  const weekStart = startOfWeek(today);
+  const month = today.slice(0, 7);
+  const doneWeek = activeTasks().filter((t) => t.status === 'done' && t.completed_at?.slice(0, 10) >= weekStart).length;
+  const doneMonth = activeTasks().filter((t) => t.status === 'done' && t.completed_at?.startsWith(month)).length;
+  const completedMonth = activeTasks().filter((t) => t.status === 'done' && t.completed_at?.startsWith(month));
+  const estimatedMonth = completedMonth.reduce((sum, t) => sum + Number(t.duration_min || 0), 0);
+  const actualMonth = completedMonth.reduce((sum, t) => sum + Number(t.actual_duration_min || t.duration_min || 0), 0);
 
   const timeline = items.length ? html`<div class="tgTimeline">${raw(items.map((it) => `
-    <div class="tgTimeItem" style="background:${it.kind === 'task' ? `var(--q${it.quad || 4})` : 'var(--q2)'}">
-      <b>${esc(fmtTime(it.start))}</b>
-      <span>${esc(it.title)}</span>
-      <b style="width:auto;color:#57574f">${esc(fmtDuration(minutesOf(it.end) - minutesOf(it.start)))}</b>
-    </div>`).join(''))}</div>`
-    : '<div class="tgQuadEmpty">Hoy no tienes nada agendado.</div>';
-
-  const listOf = (list, empty) => (list.length
-    ? `<div class="tgQuadList">${list.map((t) => taskCardHTML(t)).join('')}</div>`
-    : `<div class="tgQuadEmpty">${empty}</div>`);
+    <button class="tgTimeItem" type="button" data-${it.kind === 'task' ? 'task' : 'event'}="${it.id}"
+      style="background:${it.kind === 'task' ? `var(--q${it.quad || 4})` : 'var(--q2)'}">
+      <b>${esc(fmtTime(it.start))}</b><span>${esc(it.title)}</span>
+      <b class="tgTimeDuration">${esc(fmtDuration(minutesOf(it.end) - minutesOf(it.start)))}</b>
+    </button>`).join(''))}</div>` : '<div class="tgQuadEmpty">Hoy no tienes nada agendado.</div>';
 
   return html`
-    ${raw(statsHTML())}
-    <div class="tgToday">
-      <div class="tgCard">
-        <h4>TU DÍA, HORA POR HORA</h4>
-        <p>Compromisos fijos y tareas que ya llevaste a la agenda.</p>
-        ${raw(timeline)}
-      </div>
-      <div class="tgCard">
-        <h4>VENCEN HOY</h4>
-        <p>Tareas cuyo límite es hoy.</p>
-        ${raw(listOf(vencen, 'Nada vence hoy.'))}
-        <h4 style="margin-top:26px">SE TE PASARON</h4>
-        <p>Límite ya cumplido y siguen abiertas.</p>
-        ${raw(listOf(vencidas, 'Ninguna vencida. Impecable.'))}
-      </div>
-    </div>`;
+    ${raw(missed.length ? `<section class="tgMissed"><b>No completaste “${esc(missed[0].title)}”.</b><span>¿Qué quieres hacer?</span>
+      <div><button data-act="missed-reschedule" data-id="${missed[0].id}">Reprogramar</button>
+      <button data-act="missed-pending" data-id="${missed[0].id}">Mantener pendiente</button>
+      <button data-act="missed-complete" data-id="${missed[0].id}">Completar</button></div></section>` : '')}
+    ${raw(overload.required > overload.available ? `<section class="tgOverload"><b>Tu semana está sobrecargada.</b>
+      <p>Tienes ${esc(fmtDuration(overload.required))} de tareas próximas y ${esc(fmtDuration(overload.available))} libres. Empieza por: ${overload.tasks.map((t) => esc(t.title)).join(' · ')}</p></section>` : '')}
+    <section class="tgNow">
+      <span>// LO MÁS URGENTE AHORA</span>
+      ${raw(focus ? `<h2>${esc(focus.title)}</h2><p>${focus.due_date ? (daysUntil(focus.due_date) < 0 ? 'Vencida' : daysUntil(focus.due_date) === 0 ? 'Vence hoy' : 'Límite ' + esc(focus.due_date)) : 'Sin fecha límite'} · ${esc(fmtDuration(focus.duration_min))} · Q${quadOf(focus) || 4}</p>
+        <div class="tgNowActions"><button class="tgBtn tgBtn--ink" data-act="do-now" data-id="${focus.id}">HACER AHORA</button>
+        <button class="tgBtn tgBtn--plain" data-act="schedule" data-task-id="${focus.id}">AGENDAR</button></div>`
+        : '<div class="tgQuadEmpty">No tienes tareas pendientes. Buena señal.</div>')}
+    </section>
+    <div class="tgTodayGrid">
+      <section class="tgCard"><h4>AGENDA DE HOY</h4><p>Compromisos y tareas ya agendadas.</p>${raw(timeline)}</section>
+      <section class="tgCard"><h4>TAREAS PARA HOY</h4><p>Solo las que vencen o están agendadas hoy.</p>
+        ${raw((pending().filter((t) => t.due_date === today || t.scheduled_date === today).slice(0, 5).map((t) => taskCardHTML(t)).join('')) || '<div class="tgQuadEmpty">Nada pendiente para hoy.</div>')}</section>
+    </div>
+    <section class="tgCard tgSuggestions"><div class="tgSectionHead"><div><h4>SUGERENCIAS</h4><p>${gaps.length ? `Detecté ${gaps.length} huecos libres hoy.` : 'No quedan huecos de 30 minutos hoy.'}</p></div><a class="tgBtn tgBtn--plain tgBtn--sm" href="#/tareas/agenda">PLAN DE LA SEMANA</a></div>
+      ${raw(suggestions.length ? `<div class="tgSuggestGrid">${suggestions.map(({ task, gap }) => `<article><b>${esc(task.title)}</b><span>${esc(fmtDuration(task.duration_min))} · Q${quadOf(task) || 4}</span><p>Te la recomiendo porque ${esc(reasonFor(task, gap))}.</p><button data-act="accept-suggestion" data-id="${task.id}" data-date="${today}" data-time="${timeFromMinutes(gap.start)}">Agendar ${esc(fmtTime(timeFromMinutes(gap.start)))}</button></article>`).join('')}</div>` : '<div class="tgQuadEmpty">No hay una sugerencia útil en este momento.</div>')}
+    </section>
+    <div class="tgMiniStats"><span><b>${doneWeek}</b> completadas esta semana</span><span><b>${doneMonth}</b> completadas este mes</span><span><b>${pending().filter((t) => t.due_date && t.due_date < today).length}</b> vencidas</span><span><b>${pending().reduce((s, t) => s + Number(t.reschedule_count || 0), 0)}</b> reprogramaciones</span><span><b>${esc(fmtDuration(estimatedMonth))}</b> estimado · ${esc(fmtDuration(actualMonth))} real</span></div>`;
 }
 
 function dayItems(iso) {
@@ -232,11 +315,14 @@ function dayItems(iso) {
   const out = [];
 
   state.events.forEach((e) => {
+    if ((e.recurrence_exceptions || []).some((x) => x.date === iso && x.cancelled)) return;
     let applies = false;
     if (e.recurrence === 'none') applies = e.event_date === iso;
     else if (iso >= e.event_date && (!e.repeat_until || iso <= e.repeat_until)) {
       if (e.recurrence === 'weekdays') applies = dow >= 1 && dow <= 5;
       else if (e.recurrence === 'weekly') applies = dateAt(e.event_date).getDay() === dow;
+      else if (e.recurrence === 'daily') applies = true;
+      else if (e.recurrence === 'monthly') applies = dateAt(e.event_date).getDate() === dateAt(iso).getDate();
     }
     if (applies) {
       out.push({
@@ -289,18 +375,20 @@ function viewAgenda() {
         const span = Math.max(1, Math.round((minutesOf(it.end) - minutesOf(it.start)) / 30));
         const h = span * SLOT_H - 5;
         if (it.kind === 'event') {
-          return `<div class="tgEvent" data-event="${it.id}" style="height:${h}px;border-left-color:${esc(it.color)}">
+          return `<div class="tgEvent" data-event="${it.id}" data-date="${iso}" draggable="true" style="height:${h}px;border-left-color:${esc(it.color)}">
             <small>${esc(fmtTime(it.start))} → ${esc(fmtTime(it.end))}</small>
             <b>${esc(it.title)}</b>
             <i>${esc(fmtDuration(minutesOf(it.end) - minutesOf(it.start)))}</i>
+            <button class="tgEventMove" data-act="pickevent" aria-label="Mover compromiso">✥</button>
           </div>`;
         }
         return `<div class="tgEvent tgEvent--task q${it.quad || 4} ${it.done ? 'is-done' : ''}"
-                     data-task="${it.id}" data-act="edit" style="height:${h}px">
+                     data-task="${it.id}" draggable="true" style="height:${h}px">
           <button class="tgEventDone" type="button" data-act="toggle" aria-label="Completar">✓</button>
           <small>${esc(fmtTime(it.start))}</small>
           <b>${esc(it.title)}</b>
           <i>${esc(fmtDuration(minutesOf(it.end) - minutesOf(it.start)))}</i>
+          <span class="tgResize"><button data-act="shrink" aria-label="Reducir 30 minutos">−</button><button data-act="grow" aria-label="Aumentar 30 minutos">＋</button></span>
         </div>`;
       }).join('');
       return `<td class="tgSlot" data-date="${iso}" data-time="${timeFromMinutes(m)}">${inner}</td>`;
@@ -341,13 +429,27 @@ function viewAgenda() {
           <tbody>${raw(rows.join(''))}</tbody>
         </table>
       </div>
-    </div>`;
+    </div>
+    <section class="tgWeekPlan">
+      <div class="tgSectionHead"><div><span>// PLAN AUTOMÁTICO</span><h3>PLAN DE LA SEMANA</h3><p>Sugerencias, no movimientos automáticos.</p></div>
+      <div class="tgPlanControls"><label>Prefiero trabajar <select class="select" id="tgPreferredPeriod"><option value="morning" ${state.preferredPeriod === 'morning' ? 'selected' : ''}>en la mañana</option><option value="afternoon" ${state.preferredPeriod === 'afternoon' ? 'selected' : ''}>en la tarde</option><option value="night" ${state.preferredPeriod === 'night' ? 'selected' : ''}>en la noche</option></select></label><button class="tgBtn tgBtn--plain" type="button" data-act="todayweek">VOLVER A ESTA SEMANA</button></div></div>
+      <div class="tgWeekSuggestions">${raw(days.map((iso) => {
+        const suggestion = suggestionsFor(iso, 1).suggestions[0];
+        const d = dateAt(iso);
+        return `<article><b>${DIAS_CORTOS[d.getDay()]} ${d.getDate()}</b>${suggestion
+          ? `<span>${esc(suggestion.task.title)}</span><small>${esc(fmtTime(timeFromMinutes(suggestion.gap.start)))} · ${esc(fmtDuration(suggestion.task.duration_min))}</small><button data-act="accept-suggestion" data-id="${suggestion.task.id}" data-date="${iso}" data-time="${timeFromMinutes(suggestion.gap.start)}">Agendar</button>`
+          : '<span>Sin sugerencia</span><small>Agenda llena o sin pendientes compatibles.</small>'}</article>`;
+      }).join(''))}</div>
+    </section>
+    <section class="tgCalendarSync"><div><span>GOOGLE CALENDAR</span><h3>Sincronización preparada</h3><p>Compromisos y tareas agendadas tienen identificadores y estado de sync listos. Falta conectar credenciales OAuth protegidas para activar la sincronización bidireccional.</p></div><button class="tgBtn" type="button" data-act="calendar-info">CONFIGURAR</button></section>`;
 }
 
 function viewProyectos() {
   const cards = state.projects.map((p) => {
     const all = state.tasks.filter((t) => t.project_id === p.id);
-    const open = all.filter((t) => t.status !== 'done');
+    const open = all.filter((t) => t.status !== 'done' && !t.archived_at);
+    const done = all.filter((t) => t.status === 'done' && !t.archived_at);
+    const progress = all.length ? Math.round((done.length / all.length) * 100) : 0;
     const avatar = p.image_url
       ? `<img src="${esc(p.image_url)}" alt="">`
       : esc((p.name || '?').trim().charAt(0).toUpperCase());
@@ -357,7 +459,8 @@ function viewProyectos() {
           <div class="tgAvatar">${raw(avatar)}</div>
           <div class="tgProjName">
             <b>${p.name}</b>
-            <small>${String(open.length)} ${open.length === 1 ? 'pendiente' : 'pendientes'}</small>
+            <small>${String(open.length)} pendientes · ${String(done.length)} completadas</small>
+            <span class="tgProgress"><i style="width:${progress}%"></i></span>
           </div>
           <div class="tgProjActions">
             <button class="tgBtn tgBtn--sm tgProjOpen" type="button" data-act="openproj">Abrir</button>
@@ -366,9 +469,9 @@ function viewProyectos() {
         </div>
         <details class="tgProjBody">
           <summary>▶ Ver tareas <span class="tgBadge">${String(open.length)}</span></summary>
-          ${raw(open.length
-            ? `<div class="tgProjTasks">${open.map((t) => taskCardHTML(t)).join('')}</div>`
-            : '<div class="tgQuadEmpty">Este proyecto no tiene pendientes.</div>')}
+          ${raw(all.length
+            ? `<div class="tgProjTasks">${all.filter((t) => !t.archived_at).map((t) => taskCardHTML(t)).join('')}</div>`
+            : '<div class="tgQuadEmpty">Este proyecto aún no tiene tareas.</div>')}
         </details>
       </article>`;
   }).join('');
@@ -386,16 +489,22 @@ function viewProyectos() {
 }
 
 function viewRecordatorios() {
-  const notes = state.notes.map((n) => html`
+  const q = state.noteQuery.trim().toLocaleLowerCase('es');
+  const visible = state.notes.filter((n) => !q || n.body.toLocaleLowerCase('es').includes(q));
+  const notes = visible.map((n) => html`
     <article class="tgNote" data-note="${n.id}" style="background:${n.color}">
       <textarea data-act="notebody" placeholder="Escribe…">${n.body}</textarea>
+      <div class="tgNoteMeta">${n.remind_at ? `⏰ ${esc(new Date(n.remind_at).toLocaleString('es-CO', { dateStyle: 'medium', timeStyle: 'short' }))}` : 'Sin aviso'}${n.notification_enabled ? ' · notificación activa' : ''}</div>
       <div class="tgNoteFoot">
         <button class="tgReviewed" type="button" data-act="review" aria-pressed="${n.reviewed ? 'true' : 'false'}">Revisado</button>
+        <button class="tgReviewed" type="button" data-act="editnote">Aviso</button>
         <button class="tgNoteX" type="button" data-act="notedel" aria-label="Borrar">✕</button>
       </div>
     </article>`).join('');
 
   return html`
+    <div class="tgReminderTools"><label>Buscar recordatorios <input class="input" id="tgNoteSearch" type="search" value="${state.noteQuery}" placeholder="Texto de la nota"></label>
+      <button class="tgBtn tgBtn--plain tgBtn--sm" type="button" data-act="notifications">ACTIVAR NOTIFICACIONES</button></div>
     <form class="tgNoteNew" id="tgNoteNew">
       <textarea id="tgNoteInput" placeholder="¿Qué necesitas recordar o pensar?"></textarea>
       <button class="tgBtn" type="submit">PEGAR NOTA</button>
@@ -428,7 +537,7 @@ function paint() {
     </div>
     ${raw(views[state.section]())}`;
 
-  $$('.tgNav button', root).forEach((b) => {
+  $$('.tgNav [data-section]', root).forEach((b) => {
     b.setAttribute('aria-current', String(b.dataset.section === state.section));
   });
 
@@ -445,8 +554,14 @@ async function reload({ silent = false } = {}) {
     const [tasks, projects, notes, events] = await Promise.all([
       Tasks.list(), Projects.list(), Notes.list(), Agenda.list(),
     ]);
-    state = { ...state, tasks, projects, notes, events };
-    writeCache('tgModule', { tasks, projects, notes, events });
+    const scoped = {
+      tasks: tasks.filter(visibleForProfile),
+      projects: projects.filter(visibleForProfile).filter((p) => !p.archived),
+      notes: notes.filter(visibleForProfile).filter((n) => n.status !== 'done'),
+      events: events.filter(visibleForProfile).filter((e) => !e.archived_at),
+    };
+    state = { ...state, ...scoped };
+    writeCache(`tgModule:${perfilActivo()?.id || 'legacy'}`, scoped);
     paint();
   } catch {
     if (!silent) toast('Sin conexión: viendo la última copia', 'info');
@@ -471,22 +586,49 @@ async function patchTask(id, patch, okMsg) {
   } catch { toast('No se pudo guardar', 'err'); reload(); }
 }
 
-function toggleTask(id) {
+async function toggleTask(id) {
   const t = state.tasks.find((x) => x.id === id);
   if (!t) return;
   const done = t.status !== 'done';
-  patchTask(id, {
+  let timerElapsed = Number(t.timer_elapsed_sec || 0);
+  if (t.timer_started_at) timerElapsed += Math.max(0, Math.floor((Date.now() - new Date(t.timer_started_at).getTime()) / 1000));
+  await patchTask(id, {
     status: done ? 'done' : 'todo',
     completed_at: done ? new Date().toISOString() : null,
+    actual_duration_min: done ? (timerElapsed ? Math.max(1, Math.round(timerElapsed / 60)) : Number(t.duration_min || 30)) : t.actual_duration_min,
+    timer_started_at: null,
+    timer_elapsed_sec: timerElapsed,
   }, done ? '¡Hecho! ✓' : null);
+  if (done && t.recurrence_rule?.frequency && !state.tasks.some((x) => x.recurrence_parent_id === t.id)) {
+    const next = nextRecurringDate(t.due_date || t.scheduled_date || todayISO(), t.recurrence_rule.frequency);
+    const copy = { ...t };
+    ['id', 'created_at', 'updated_at', 'completed_at', 'archived_at'].forEach((k) => delete copy[k]);
+    await createTask({ ...copy, status: 'todo', due_date: t.due_date ? next : null,
+      scheduled_date: null, scheduled_time: null, recurrence_parent_id: t.id,
+      timer_started_at: null, timer_elapsed_sec: 0, actual_duration_min: null });
+  }
+}
+
+function nextRecurringDate(from, frequency) {
+  let next = addDays(from, frequency === 'weekly' ? 7 : 1);
+  if (frequency === 'weekdays') while ([0, 6].includes(dateAt(next).getDay())) next = addDays(next, 1);
+  if (frequency === 'monthly') {
+    const d = dateAt(from); d.setMonth(d.getMonth() + 1); next = d.toLocaleDateString('en-CA');
+  }
+  return next;
+}
+
+function toggleTimer(task) {
+  if (task.timer_started_at) {
+    const extra = Math.max(0, Math.floor((Date.now() - new Date(task.timer_started_at).getTime()) / 1000));
+    return patchTask(task.id, { timer_started_at: null, timer_elapsed_sec: Number(task.timer_elapsed_sec || 0) + extra }, 'Temporizador pausado');
+  }
+  return patchTask(task.id, { timer_started_at: new Date().toISOString(), status: task.status === 'done' ? 'todo' : 'doing' }, 'Temporizador iniciado');
 }
 
 function removeTask(id) {
-  confirmSheet('Borrar tarea', '¿Seguro? Esto no se puede deshacer.', async () => {
-    state.tasks = state.tasks.filter((t) => t.id !== id);
-    paint();
-    try { await Tasks.remove(id); toast('Borrada'); }
-    catch { toast('No se pudo borrar', 'err'); reload(); }
+  confirmSheet('Archivar tarea', 'Se ocultará sin borrar su historial.', async () => {
+    await patchTask(id, { archived_at: new Date().toISOString() }, 'Tarea archivada');
   });
 }
 
@@ -495,7 +637,7 @@ function taskSheet(task) {
   const t = task || {
     title: '', notes: '', due_date: '', duration_min: 30,
     project_id: '', urgent: false, important: false,
-    scheduled_date: '', scheduled_time: '',
+    notification_enabled: false, recurrence_rule: null,
   };
 
   sheet({
@@ -526,24 +668,27 @@ function taskSheet(task) {
         <input class="input" id="k-due" type="date" value="${t.due_date || ''}"></div>
 
       <div class="grid2">
-        <div class="field"><label>Agendar el día</label>
-          <input class="input" id="k-sdate" type="date" value="${t.scheduled_date || ''}"></div>
-        <div class="field"><label>A las</label>
-          <input class="input" id="k-stime" type="time" step="1800" value="${(t.scheduled_time || '').slice(0, 5)}"></div>
+        <div class="field"><label>Repetición</label><select class="select" id="k-rec">
+          <option value="none">No se repite</option>
+          <option value="daily" ${t.recurrence_rule?.frequency === 'daily' ? 'selected' : ''}>Cada día</option>
+          <option value="weekdays" ${t.recurrence_rule?.frequency === 'weekdays' ? 'selected' : ''}>Lunes a viernes</option>
+          <option value="weekly" ${t.recurrence_rule?.frequency === 'weekly' ? 'selected' : ''}>Cada semana</option>
+          <option value="monthly" ${t.recurrence_rule?.frequency === 'monthly' ? 'selected' : ''}>Cada mes</option>
+        </select></div>
+        <div class="field"><label>Avisos</label><label class="tgInlineCheck"><input id="k-notify" type="checkbox" ${t.notification_enabled ? 'checked' : ''}> Notificar al acercarse la fecha</label></div>
       </div>
 
       <div class="field"><label>Notas</label>
         <textarea class="textarea" id="k-notes" placeholder="Detalles, links, lo que sea">${t.notes || ''}</textarea></div>`,
     actions: [
-      ...(isNew ? [] : [{ label: 'Borrar', variant: 'danger', onClick: ({ close }) => { close(); removeTask(t.id); } }]),
+      ...(isNew ? [] : [{ label: 'Archivar', variant: 'danger', onClick: ({ close }) => { close(); removeTask(t.id); } }]),
       {
         label: isNew ? 'Agregar a la matriz' : 'Guardar',
         variant: 'primary',
         onClick: async ({ close, root: r }) => {
           const title = $('#k-title', r).value.trim();
           if (!title) return toast('Ponle un título', 'err');
-          const sdate = $('#k-sdate', r).value || null;
-          const stime = $('#k-stime', r).value || null;
+          const recurrence = $('#k-rec', r).value;
           const patch = {
             title,
             urgent: $('#k-urgent', r).getAttribute('aria-pressed') === 'true',
@@ -552,12 +697,12 @@ function taskSheet(task) {
             project_id: $('#k-proj', r).value || null,
             duration_min: Number($('#k-dur', r).value),
             due_date: $('#k-due', r).value || null,
-            scheduled_date: sdate && stime ? sdate : null,
-            scheduled_time: sdate && stime ? stime : null,
+            recurrence_rule: recurrence === 'none' ? null : { frequency: recurrence },
+            notification_enabled: $('#k-notify', r).checked,
             notes: $('#k-notes', r).value,
           };
           close();
-          if (isNew) await createTask({ ...patch, status: 'todo' });
+          if (isNew) await createTask({ ...patch, profile_id: perfilActivo()?.id || null, status: 'todo' });
           else await patchTask(t.id, patch, 'Guardado');
         },
       },
@@ -593,7 +738,7 @@ function scheduleSheet(task) {
         label: 'Quitar de la agenda',
         onClick: ({ close }) => {
           close();
-          patchTask(task.id, { scheduled_date: null, scheduled_time: null }, 'Fuera de la agenda');
+          patchTask(task.id, { scheduled_date: null, scheduled_time: null, reschedule_count: Number(task.reschedule_count || 0) + 1 }, 'Fuera de la agenda');
         },
       }] : []),
       {
@@ -606,6 +751,7 @@ function scheduleSheet(task) {
           patchTask(task.id, {
             scheduled_date: date, scheduled_time: time,
             duration_min: Number($('#s-dur', r).value),
+            reschedule_count: Number(task.reschedule_count || 0) + (task.scheduled_date && (task.scheduled_date !== date || task.scheduled_time?.slice(0, 5) !== time) ? 1 : 0),
           }, 'Agendada ✓');
         },
       },
@@ -613,7 +759,7 @@ function scheduleSheet(task) {
   });
 }
 
-function eventSheet(ev) {
+function eventSheet(ev, occurrenceDate = ev?.event_date) {
   const isNew = !ev;
   const e = ev || { title: '', event_date: todayISO(), start_time: '09:00', end_time: '10:00', color: '#42a5ff', recurrence: 'none', repeat_until: '' };
   sheet({
@@ -622,7 +768,7 @@ function eventSheet(ev) {
       <div class="field"><label>Nombre</label>
         <input class="input" id="e-title" value="${e.title}" placeholder="Ej. Dead Camera"></div>
       <div class="field"><label>Fecha</label>
-        <input class="input" id="e-date" type="date" value="${e.event_date}"></div>
+        <input class="input" id="e-date" type="date" value="${occurrenceDate || e.event_date}"></div>
       <div class="grid2">
         <div class="field"><label>Desde</label>
           <input class="input" id="e-start" type="time" step="1800" value="${(e.start_time || '').slice(0, 5)}"></div>
@@ -633,22 +779,26 @@ function eventSheet(ev) {
         <div class="field"><label>Se repite</label>
           <select class="select" id="e-rec">
             <option value="none" ${e.recurrence === 'none' ? 'selected' : ''}>No se repite</option>
+            <option value="daily" ${e.recurrence === 'daily' ? 'selected' : ''}>Cada día</option>
             <option value="weekdays" ${e.recurrence === 'weekdays' ? 'selected' : ''}>Lunes a viernes</option>
             <option value="weekly" ${e.recurrence === 'weekly' ? 'selected' : ''}>Cada semana</option>
+            <option value="monthly" ${e.recurrence === 'monthly' ? 'selected' : ''}>Cada mes</option>
           </select></div>
         <div class="field"><label>Color</label>
           <input class="input" id="e-color" type="color" value="${e.color}" style="height:48px;padding:4px"></div>
       </div>
       <div class="field"><label>Repetir hasta (opcional)</label>
-        <input class="input" id="e-until" type="date" value="${e.repeat_until || ''}"></div>`,
+        <input class="input" id="e-until" type="date" value="${e.repeat_until || ''}"></div>
+      ${raw(!isNew && e.recurrence !== 'none' ? `<div class="field"><label>Aplicar cambio</label><select class="select" id="e-scope"><option value="this">Solo esta fecha (${esc(occurrenceDate)})</option><option value="future">Esta y las futuras</option><option value="all">Toda la serie</option></select></div>` : '')}
+      <label class="tgInlineCheck"><input id="e-notify" type="checkbox" ${e.notification_enabled ? 'checked' : ''}> Notificar antes del compromiso</label>`,
     actions: [
       ...(isNew ? [] : [{
-        label: 'Borrar', variant: 'danger',
+        label: 'Archivar', variant: 'danger',
         onClick: ({ close }) => {
           close();
-          confirmSheet('Borrar compromiso', '¿Seguro?', async () => {
-            try { await Agenda.remove(e.id); await reload(); toast('Borrado'); }
-            catch { toast('No se pudo borrar', 'err'); }
+          confirmSheet('Archivar compromiso', 'Se ocultará sin borrar su historial.', async () => {
+            try { await Agenda.update(e.id, { archived_at: new Date().toISOString() }); await reload(); toast('Archivado'); }
+            catch { toast('No se pudo archivar', 'err'); }
           });
         },
       }]),
@@ -663,13 +813,22 @@ function eventSheet(ev) {
             recurrence: $('#e-rec', r).value,
             color: $('#e-color', r).value,
             repeat_until: $('#e-until', r).value || null,
+            notification_enabled: $('#e-notify', r).checked,
           };
           if (!payload.title || !payload.event_date) return toast('Falta el nombre o la fecha', 'err');
           if (minutesOf(payload.end_time) <= minutesOf(payload.start_time)) return toast('La hora final debe ir después', 'err');
           close();
           try {
-            if (isNew) await Agenda.create(payload);
-            else await Agenda.update(e.id, payload);
+            if (isNew) await Agenda.create({ ...payload, profile_id: perfilActivo()?.id || null });
+            else if (e.recurrence !== 'none' && $('#e-scope', r)?.value === 'this') {
+              const exceptions = [...(e.recurrence_exceptions || []), { date: occurrenceDate, cancelled: true }];
+              await Agenda.update(e.id, { recurrence_exceptions: exceptions });
+              await Agenda.create({ ...payload, event_date: occurrenceDate, recurrence: 'none', repeat_until: null, profile_id: perfilActivo()?.id || null });
+            } else {
+              if ($('#e-scope', r)?.value === 'future') payload.event_date = occurrenceDate;
+              if ($('#e-scope', r)?.value === 'all' && payload.event_date === occurrenceDate) payload.event_date = e.event_date;
+              await Agenda.update(e.id, payload);
+            }
             await reload();
             toast(isNew ? 'Compromiso creado' : 'Guardado');
           } catch { toast('No se pudo guardar', 'err'); }
@@ -695,12 +854,12 @@ function projectSheet(proj) {
         <input class="input" id="p-img" value="${p.image_url || ''}" placeholder="https://…"></div>`,
     actions: [
       ...(isNew ? [] : [{
-        label: 'Borrar', variant: 'danger',
+        label: 'Archivar', variant: 'danger',
         onClick: ({ close }) => {
           close();
-          confirmSheet('Borrar proyecto', 'Las tareas se conservan, pero quedan sin proyecto.', async () => {
-            try { await Projects.remove(p.id); await reload(); toast('Proyecto borrado'); }
-            catch { toast('No se pudo borrar', 'err'); }
+          confirmSheet('Archivar proyecto', 'Las tareas y el historial se conservan.', async () => {
+            try { await Projects.update(p.id, { archived: true }); await reload(); toast('Proyecto archivado'); }
+            catch { toast('No se pudo archivar', 'err'); }
           });
         },
       }]),
@@ -716,7 +875,7 @@ function projectSheet(proj) {
           if (!payload.name) return toast('Ponle un nombre', 'err');
           close();
           try {
-            if (isNew) await Projects.create({ ...payload, sort_order: state.projects.length + 1 });
+            if (isNew) await Projects.create({ ...payload, profile_id: perfilActivo()?.id || null, sort_order: state.projects.length + 1 });
             else await Projects.update(p.id, payload);
             await reload();
             toast(isNew ? 'Proyecto creado' : 'Guardado');
@@ -727,33 +886,49 @@ function projectSheet(proj) {
   });
 }
 
-function belSheet() {
+function noteSheet(note) {
   sheet({
-    title: 'BEL · nota rápida',
+    title: 'Aviso del recordatorio',
     body: html`
-      <p class="sheetText">Escribe lo que sea y queda guardado en <b>Recordatorios</b>.</p>
-      <div class="field"><textarea class="textarea" id="bel-text" placeholder="¿Qué quieres anotar?"></textarea></div>`,
+      <p class="sheetText"><b>${note.body}</b></p>
+      <div class="field"><label>Fecha y hora (opcional)</label><input class="input" id="n-remind" type="datetime-local" value="${note.remind_at ? note.remind_at.slice(0, 16) : ''}"></div>
+      <label class="tgInlineCheck"><input id="n-notify" type="checkbox" ${note.notification_enabled ? 'checked' : ''}> Mostrar notificación</label>`,
     actions: [{
-      label: 'Guardar nota', variant: 'primary',
+      label: 'Guardar aviso', variant: 'primary',
       onClick: async ({ close, root: r }) => {
-        const body = $('#bel-text', r).value.trim();
-        if (!body) return toast('Escribe algo primero', 'err');
+        const local = $('#n-remind', r).value;
         close();
         try {
-          await Notes.create({ body, color: NOTE_COLORS[state.notes.length % NOTE_COLORS.length] });
+          await Notes.update(note.id, { remind_at: local ? new Date(local).toISOString() : null, notification_enabled: $('#n-notify', r).checked });
           await reload();
-          toast('Anotado en Recordatorios');
+          toast('Aviso guardado');
         } catch { toast('No se pudo guardar', 'err'); }
       },
     }],
   });
 }
 
+function checkNotifications() {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  const now = Date.now();
+  const upcoming = [
+    ...state.notes.filter((n) => n.notification_enabled && n.remind_at).map((n) => ({ id: `n:${n.id}:${n.remind_at}`, title: 'Recordatorio', body: n.body, at: new Date(n.remind_at).getTime() })),
+    ...pending().filter((t) => t.notification_enabled && t.scheduled_date && t.scheduled_time).map((t) => ({ id: `t:${t.id}:${t.scheduled_date}:${t.scheduled_time}`, title: 'Tarea próxima', body: t.title, at: new Date(`${t.scheduled_date}T${t.scheduled_time}`).getTime() })),
+  ];
+  upcoming.filter((x) => x.at <= now + 15 * 60e3 && x.at >= now - 60e3).forEach((x) => {
+    const key = `ashub:notified:${x.id}`;
+    if (localStorage.getItem(key)) return;
+    localStorage.setItem(key, '1');
+    new Notification(x.title, { body: x.body, icon: '/icons/icon-192.png', tag: x.id });
+  });
+}
+
 export async function render(container) {
   root = container;
   document.body.dataset.skin = 'taskgrid';
+  state.section = sectionFromHash();
 
-  const cache = readCache('tgModule');
+  const cache = readCache(`tgModule:${perfilActivo()?.id || 'legacy'}`);
   if (cache) state = { ...state, ...cache };
   if (!state.weekStart) state.weekStart = startOfWeek(todayISO());
 
@@ -766,9 +941,9 @@ export async function render(container) {
         </div>
         <nav class="tgNav">
           ${raw(SECTIONS.map((s) => `
-            <button type="button" data-section="${s.id}" aria-current="${s.id === state.section}">
+            <a href="${routeFor(s.id)}" data-section="${s.id}" aria-current="${s.id === state.section}">
               <span>${s.icon}</span>${esc(s.label)}
-            </button>`).join(''))}
+            </a>`).join(''))}
         </nav>
         <div class="tgSync">
           <b>◍ SINCRONIZADO · TODOS TUS DISPOSITIVOS</b>
@@ -777,21 +952,20 @@ export async function render(container) {
       </aside>
       <div class="tgMain" id="tgMain"></div>
     </div>
-    <button class="bel" id="belBtn" type="button"><i>◕‿◕</i>BEL</button>`;
+    <button class="tgTaskFab" id="tgTaskFab" type="button" aria-label="Nueva tarea">＋</button>`;
 
   paint();
   await reload({ silent: true });
 
   $('.tgNav', root).addEventListener('click', (e) => {
-    const b = e.target.closest('button[data-section]');
+    const b = e.target.closest('[data-section]');
     if (!b) return;
     state.section = b.dataset.section;
     state.picked = null;
-    paint();
     window.scrollTo({ top: 0, behavior: 'smooth' });
   });
 
-  $('#belBtn', root).addEventListener('click', belSheet);
+  $('#tgTaskFab', root).addEventListener('click', () => taskSheet(null));
 
   const main = $('#tgMain', root);
 
@@ -805,7 +979,7 @@ export async function render(container) {
       createTask({
         title, status: 'todo', classified: true,
         urgent: state.capture.urgent, important: state.capture.important,
-        duration_min: 30,
+        duration_min: 30, profile_id: perfilActivo()?.id || null,
       });
       state.capture = { urgent: false, important: false };
     }
@@ -815,7 +989,7 @@ export async function render(container) {
       const body = ta.value.trim();
       if (!body) return;
       ta.value = '';
-      Notes.create({ body, color: NOTE_COLORS[state.notes.length % NOTE_COLORS.length] })
+      Notes.create({ body, color: NOTE_COLORS[state.notes.length % NOTE_COLORS.length], profile_id: perfilActivo()?.id || null })
         .then(() => reload()).catch(() => toast('No se pudo pegar la nota', 'err'));
     }
   });
@@ -838,14 +1012,45 @@ export async function render(container) {
     if (act === 'clearfilter') { state.projectFilter = null; return paint(); }
     if (act === 'prevweek') { state.weekStart = addDays(state.weekStart, -7); return paint(); }
     if (act === 'nextweek') { state.weekStart = addDays(state.weekStart, 7); return paint(); }
+    if (act === 'todayweek') { state.weekStart = startOfWeek(todayISO()); return paint(); }
+    if (act === 'calendar-info') return toast('La conexión requiere OAuth protegido en una función del servidor. La estructura de sincronización ya está lista.', 'info');
+    if (act === 'notifications') {
+      if (!('Notification' in window)) return toast('Este navegador no admite notificaciones', 'err');
+      Notification.requestPermission().then((permission) => {
+        toast(permission === 'granted' ? 'Notificaciones activadas' : 'Permiso no concedido', permission === 'granted' ? 'ok' : 'info');
+        checkNotifications();
+      });
+      return;
+    }
+    if (act === 'accept-suggestion') {
+      const task = state.tasks.find((t) => t.id === actEl.dataset.id);
+      if (!task) return;
+      return patchTask(task.id, { scheduled_date: actEl.dataset.date, scheduled_time: actEl.dataset.time,
+        reschedule_count: Number(task.reschedule_count || 0) + (task.scheduled_date ? 1 : 0) }, 'Sugerencia agendada');
+    }
+    if (act === 'do-now') {
+      const task = state.tasks.find((t) => t.id === actEl.dataset.id);
+      if (task) return toggleTimer(task);
+    }
+    if (act?.startsWith('missed-')) {
+      const task = state.tasks.find((t) => t.id === actEl.dataset.id);
+      if (!task) return;
+      if (act === 'missed-reschedule') return scheduleSheet(task);
+      if (act === 'missed-complete') return toggleTask(task.id);
+      return patchTask(task.id, { scheduled_date: null, scheduled_time: null, reschedule_count: Number(task.reschedule_count || 0) + 1 }, 'Quedó pendiente');
+    }
+    if (act === 'schedule' && actEl.dataset.taskId) {
+      const task = state.tasks.find((t) => t.id === actEl.dataset.taskId);
+      if (task) return scheduleSheet(task);
+    }
 
     const projEl = e.target.closest('[data-proj]');
     if (projEl && (act === 'openproj' || act === 'editproj')) {
       const p = projectOf(projEl.dataset.proj);
       if (act === 'editproj') return projectSheet(p);
       state.projectFilter = p.id;
-      state.section = 'tareas';
-      return paint();
+      location.hash = '/tareas/pendientes';
+      state.section = 'tareas'; return paint();
     }
 
     const noteEl = e.target.closest('[data-note]');
@@ -853,11 +1058,12 @@ export async function render(container) {
       const id = noteEl.dataset.note;
       const note = state.notes.find((n) => n.id === id);
       if (act === 'notedel') {
-        return confirmSheet('Borrar nota', '¿Seguro?', async () => {
+        return confirmSheet('Archivar nota', 'Se ocultará sin borrar su historial.', async () => {
           state.notes = state.notes.filter((n) => n.id !== id); paint();
-          try { await Notes.remove(id); } catch { toast('No se pudo borrar', 'err'); }
+          try { await Notes.update(id, { status: 'done' }); } catch { toast('No se pudo archivar', 'err'); }
         });
       }
+      if (act === 'editnote') return noteSheet(note);
       if (act === 'review') {
         note.reviewed = !note.reviewed;
         actEl.setAttribute('aria-pressed', String(note.reviewed));
@@ -869,14 +1075,26 @@ export async function render(container) {
     const evEl = e.target.closest('[data-event]');
     if (evEl) {
       const ev = state.events.find((x) => x.id === evEl.dataset.event);
-      if (ev) return eventSheet(ev);
+      if (act === 'pickevent' && ev) {
+        state.picked = { kind: 'event', id: ev.id };
+        toast('Ahora toca una casilla de la agenda'); return;
+      }
+      if (ev) return eventSheet(ev, evEl.dataset.date || ev.event_date);
     }
 
     const slot = e.target.closest('.tgSlot');
     if (slot && state.picked && !e.target.closest('[data-task]')) {
-      const id = state.picked;
+      const item = state.picked;
       state.picked = null;
-      return patchTask(id, { scheduled_date: slot.dataset.date, scheduled_time: slot.dataset.time }, 'Agendada ✓');
+      if (item.kind === 'event') {
+        const ev = state.events.find((x) => x.id === item.id);
+        const duration = minutesOf(ev.end_time) - minutesOf(ev.start_time);
+        return Agenda.update(ev.id, { event_date: slot.dataset.date, start_time: slot.dataset.time,
+          end_time: timeFromMinutes(minutesOf(slot.dataset.time) + duration) }).then(() => reload()).then(() => toast('Compromiso movido'));
+      }
+      const task = state.tasks.find((t) => t.id === item.id);
+      return patchTask(item.id, { scheduled_date: slot.dataset.date, scheduled_time: slot.dataset.time,
+        reschedule_count: Number(task?.reschedule_count || 0) + (task?.scheduled_date ? 1 : 0) }, 'Agendada ✓');
     }
 
     const taskEl = e.target.closest('[data-task]');
@@ -887,9 +1105,21 @@ export async function render(container) {
     if (act === 'del') return removeTask(task.id);
     if (act === 'edit') return taskSheet(task);
     if (act === 'schedule') return scheduleSheet(task);
+    if (act === 'timer') return toggleTimer(task);
+    if (act === 'shrink' || act === 'grow') {
+      const duration = Math.max(30, Math.min(240, Number(task.duration_min || 30) + (act === 'grow' ? 30 : -30)));
+      return patchTask(task.id, { duration_min: duration }, `Duración: ${fmtDuration(duration)}`);
+    }
+
+    if (taskEl.closest('.tgEvent--task')) {
+      state.picked = state.picked?.id === task.id ? null : { kind: 'task', id: task.id };
+      paint();
+      if (state.picked) toast('Ahora toca otra casilla de la agenda');
+      return;
+    }
 
     if (taskEl.closest('.tgDragBody')) {
-      state.picked = state.picked === task.id ? null : task.id;
+      state.picked = state.picked?.id === task.id ? null : { kind: 'task', id: task.id };
       paint();
       if (state.picked) toast('Ahora toca una casilla de la agenda');
     }
@@ -897,6 +1127,17 @@ export async function render(container) {
 
   let noteTimer;
   main.addEventListener('input', (e) => {
+    if (e.target.id === 'tgPreferredPeriod') {
+      state.preferredPeriod = e.target.value;
+      localStorage.setItem('ashub:tasks:preferred-period', state.preferredPeriod);
+      return paint();
+    }
+    if (e.target.id === 'tgNoteSearch') {
+      state.noteQuery = e.target.value;
+      const query = state.noteQuery.trim().toLocaleLowerCase('es');
+      $$('.tgNote', main).forEach((note) => { note.hidden = !!query && !$('textarea', note).value.toLocaleLowerCase('es').includes(query); });
+      return;
+    }
     const ta = e.target.closest('[data-act="notebody"]');
     if (!ta) return;
     autosize(ta);
@@ -909,22 +1150,22 @@ export async function render(container) {
     }, 700);
   });
 
-  let dragId = null;
+  let dragItem = null;
   main.addEventListener('dragstart', (e) => {
-    const el = e.target.closest('[data-task][draggable="true"]');
+    const el = e.target.closest('[draggable="true"][data-task], [draggable="true"][data-event]');
     if (!el) return;
-    dragId = el.dataset.task;
+    dragItem = { kind: el.dataset.task ? 'task' : 'event', id: el.dataset.task || el.dataset.event };
     el.classList.add('is-dragging');
     e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/plain', dragId);
+    e.dataTransfer.setData('text/plain', dragItem.id);
   });
   main.addEventListener('dragend', () => {
-    dragId = null;
+    dragItem = null;
     $$('.is-dragging', main).forEach((el) => el.classList.remove('is-dragging'));
   });
   main.addEventListener('dragover', (e) => {
     const slot = e.target.closest('.tgSlot');
-    if (!slot || !dragId) return;
+    if (!slot || !dragItem) return;
     e.preventDefault();
     slot.classList.add('is-drop');
   });
@@ -933,21 +1174,35 @@ export async function render(container) {
   });
   main.addEventListener('drop', (e) => {
     const slot = e.target.closest('.tgSlot');
-    if (!slot || !dragId) return;
+    if (!slot || !dragItem) return;
     e.preventDefault();
     slot.classList.remove('is-drop');
-    const id = dragId;
-    dragId = null;
-    patchTask(id, { scheduled_date: slot.dataset.date, scheduled_time: slot.dataset.time }, 'Agendada ✓');
+    const item = dragItem;
+    dragItem = null;
+    if (item.kind === 'task') {
+      const task = state.tasks.find((t) => t.id === item.id);
+      patchTask(item.id, { scheduled_date: slot.dataset.date, scheduled_time: slot.dataset.time,
+        reschedule_count: Number(task?.reschedule_count || 0) + (task?.scheduled_date ? 1 : 0) }, 'Agendada ✓');
+    } else {
+      const ev = state.events.find((x) => x.id === item.id);
+      if (!ev) return;
+      const duration = minutesOf(ev.end_time) - minutesOf(ev.start_time);
+      Agenda.update(item.id, { event_date: slot.dataset.date, start_time: slot.dataset.time,
+        end_time: timeFromMinutes(minutesOf(slot.dataset.time) + duration) }).then(() => reload()).then(() => toast('Compromiso movido')).catch(() => toast('No se pudo mover', 'err'));
+    }
   });
 
   watch('tasks', ['tasks', 'task_projects', 'notes', 'agenda_events'], () => {
     if (document.activeElement?.dataset?.act === 'notebody') return;
     reload({ silent: true });
   });
+  state.nowTimer = setInterval(() => { checkNotifications(); if (state.tasks.some((t) => t.timer_started_at)) paint(); }, 60000);
+  checkNotifications();
 }
 
 export function destroy() {
   unwatch('tasks');
+  clearInterval(state.nowTimer);
+  state.nowTimer = null;
   delete document.body.dataset.skin;
 }
