@@ -5,7 +5,7 @@ export const SUPABASE_KEY = 'sb_publishable_XC5v-_UBfrsnbTLIJPqe6w_xXz3tCA6';
 export const TZ = 'America/Bogota';
 export const CURRENCY = 'COP';
 
-export const APP_VERSION = '3.3.1';
+export const APP_VERSION = '3.3.2';
 /* Respaldo por si el servidor no informa la fecha del archivo.
    La fecha real se lee del encabezado Last-Modified (ver ui.js → buildDate). */
 export const BUILD_DATE = '2026-08-16';

@@ -5,8 +5,7 @@ const { Tasks, Projects, Notes, Agenda, watch, unwatch, readCache, writeCache } 
   await import(new URL('/js/db.js', location.origin).href);
 const { $, $$, html, raw, esc, toast, sheet, confirmSheet, todayISO, addDays } =
   await import(new URL('/js/ui.js', location.origin).href);
-const { perfilActivo, sesion } = await import(new URL('/js/session.js', location.origin).href);
-const { SUPABASE_URL, SUPABASE_KEY } = await import(new URL('/js/config.js', location.origin).href);
+const { perfilActivo } = await import(new URL('/js/session.js', location.origin).href);
 
 const svg = (d) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
   stroke-linecap="round" stroke-linejoin="round" width="19" height="19" aria-hidden="true">${d}</svg>`;
@@ -56,7 +55,6 @@ let state = {
   noteQuery: '',
   preferredPeriod: localStorage.getItem('ashub:tasks:preferred-period') || 'afternoon',
   nowTimer: null,
-  google: { loading: false, connected: false, configured: false, connection: null },
   tasks: [], projects: [], notes: [], events: [],
 };
 
@@ -442,15 +440,7 @@ function viewAgenda() {
           ? `<span>${esc(suggestion.task.title)}</span><small>${esc(fmtTime(timeFromMinutes(suggestion.gap.start)))} · ${esc(fmtDuration(suggestion.task.duration_min))}</small><button data-act="accept-suggestion" data-id="${suggestion.task.id}" data-date="${iso}" data-time="${timeFromMinutes(suggestion.gap.start)}">Agendar</button>`
           : '<span>Sin sugerencia</span><small>Agenda llena o sin pendientes compatibles.</small>'}</article>`;
       }).join(''))}</div>
-    </section>
-    <section class="tgCalendarSync"><div><span>GOOGLE CALENDAR</span><h3>${state.google.connected ? 'Cuenta conectada' : state.google.configured ? 'Conecta tu calendario' : 'OAuth seguro instalado'}</h3>
-      <p>${state.google.connected
-        ? `Sincronización bidireccional activa.${state.google.connection?.last_sync_at ? ` Última: ${esc(new Date(state.google.connection.last_sync_at).toLocaleString('es-CO'))}.` : ''}`
-        : state.google.configured ? 'Autoriza Google para importar y publicar tareas y compromisos.' : 'La función está protegida en servidor. Falta cargar las credenciales del cliente OAuth de Google.'}</p></div>
-      <div class="tgCalendarActions">${raw(state.google.connected
-        ? '<button class="tgBtn" type="button" data-act="calendar-sync">SINCRONIZAR</button><button class="tgBtn tgBtn--plain" type="button" data-act="calendar-disconnect">DESCONECTAR</button>'
-        : state.google.configured ? '<button class="tgBtn" type="button" data-act="calendar-connect">CONECTAR GOOGLE</button>'
-          : '<button class="tgBtn tgBtn--plain" type="button" data-act="calendar-info">VER CONFIGURACIÓN</button>')}</div></section>`;
+    </section>`;
 }
 
 function viewProyectos() {
@@ -577,33 +567,6 @@ async function reload({ silent = false } = {}) {
   }
 }
 
-async function googleRequest(action) {
-  const response = await fetch(`${SUPABASE_URL}/functions/v1/google-calendar`, {
-    method: 'POST',
-    headers: {
-      apikey: SUPABASE_KEY,
-      'Content-Type': 'application/json',
-      'x-as-session': sesion()?.token || '',
-    },
-    body: JSON.stringify({ action }),
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || `OAuth respondió ${response.status}`);
-  return payload;
-}
-
-async function loadGoogleStatus({ silent = false } = {}) {
-  if (state.section !== 'agenda') return;
-  try {
-    const status = await googleRequest('status');
-    state.google = { ...state.google, ...status, loading: false };
-    paint();
-  } catch (error) {
-    state.google.loading = false;
-    if (!silent) toast(error.message || 'No se pudo consultar Google Calendar', 'err');
-  }
-}
-
 async function createTask(payload) {
   try {
     await Tasks.create(payload);
@@ -613,10 +576,6 @@ async function createTask(payload) {
 }
 
 async function patchTask(id, patch, okMsg) {
-  const syncKeys = ['title', 'scheduled_date', 'scheduled_time', 'duration_min', 'status', 'archived_at'];
-  if (state.google.connected && !('sync_status' in patch) && syncKeys.some((key) => key in patch)) {
-    patch = { ...patch, sync_status: 'pending' };
-  }
   const t = state.tasks.find((x) => x.id === id);
   if (t) Object.assign(t, patch);
   paint();
@@ -837,7 +796,7 @@ function eventSheet(ev, occurrenceDate = ev?.event_date) {
         onClick: ({ close }) => {
           close();
           confirmSheet('Archivar compromiso', 'Se ocultará sin borrar su historial.', async () => {
-            try { await Agenda.update(e.id, { archived_at: new Date().toISOString(), ...(state.google.connected ? { sync_status: 'pending' } : {}) }); await reload(); toast('Archivado'); }
+            try { await Agenda.update(e.id, { archived_at: new Date().toISOString() }); await reload(); toast('Archivado'); }
             catch { toast('No se pudo archivar', 'err'); }
           });
         },
@@ -854,7 +813,6 @@ function eventSheet(ev, occurrenceDate = ev?.event_date) {
             color: $('#e-color', r).value,
             repeat_until: $('#e-until', r).value || null,
             notification_enabled: $('#e-notify', r).checked,
-            ...(!isNew && state.google.connected ? { sync_status: 'pending' } : {}),
           };
           if (!payload.title || !payload.event_date) return toast('Falta el nombre o la fecha', 'err');
           if (minutesOf(payload.end_time) <= minutesOf(payload.start_time)) return toast('La hora final debe ir después', 'err');
@@ -863,7 +821,7 @@ function eventSheet(ev, occurrenceDate = ev?.event_date) {
             if (isNew) await Agenda.create({ ...payload, profile_id: perfilActivo()?.id || null });
             else if (e.recurrence !== 'none' && $('#e-scope', r)?.value === 'this') {
               const exceptions = [...(e.recurrence_exceptions || []), { date: occurrenceDate, cancelled: true }];
-              await Agenda.update(e.id, { recurrence_exceptions: exceptions, ...(state.google.connected ? { sync_status: 'pending' } : {}) });
+              await Agenda.update(e.id, { recurrence_exceptions: exceptions });
               await Agenda.create({ ...payload, event_date: occurrenceDate, recurrence: 'none', repeat_until: null, profile_id: perfilActivo()?.id || null });
             } else {
               if ($('#e-scope', r)?.value === 'future') payload.event_date = occurrenceDate;
@@ -997,13 +955,6 @@ export async function render(container) {
 
   paint();
   await reload({ silent: true });
-  if (state.section === 'agenda') {
-    const googleResult = new URLSearchParams((location.hash.split('?')[1] || '')).get('google');
-    if (googleResult === 'connected') toast('Google Calendar conectado');
-    if (googleResult === 'denied') toast('No se concedió acceso a Google Calendar', 'info');
-    if (googleResult) history.replaceState(null, '', `${location.pathname}${location.search}#/tareas/agenda`);
-    await loadGoogleStatus({ silent: true });
-  }
 
   $('.tgNav', root).addEventListener('click', (e) => {
     const b = e.target.closest('[data-section]');
@@ -1061,25 +1012,6 @@ export async function render(container) {
     if (act === 'prevweek') { state.weekStart = addDays(state.weekStart, -7); return paint(); }
     if (act === 'nextweek') { state.weekStart = addDays(state.weekStart, 7); return paint(); }
     if (act === 'todayweek') { state.weekStart = startOfWeek(todayISO()); return paint(); }
-    if (act === 'calendar-info') return toast('Añade GOOGLE_CLIENT_ID y GOOGLE_CLIENT_SECRET en los secretos de Edge Functions. Redirect URI: ' + `${SUPABASE_URL}/functions/v1/google-calendar`, 'info');
-    if (act === 'calendar-connect') {
-      state.google.loading = true; paint();
-      return googleRequest('start').then((result) => { location.assign(result.authorization_url); })
-        .catch((error) => { state.google.loading = false; paint(); toast(error.message, 'err'); });
-    }
-    if (act === 'calendar-sync') {
-      state.google.loading = true; paint();
-      return googleRequest('sync').then(async (result) => {
-        toast(`Google: ${result.pulled} importados · ${result.pushed} publicados${result.conflicts ? ` · ${result.conflicts} conflictos` : ''}`);
-        await reload(); await loadGoogleStatus({ silent: true });
-      }).catch((error) => { state.google.loading = false; paint(); toast(error.message, 'err'); });
-    }
-    if (act === 'calendar-disconnect') {
-      return confirmSheet('Desconectar Google Calendar', 'Se revocará el token y AS Hub dejará de sincronizar.', async () => {
-        try { await googleRequest('disconnect'); state.google = { loading: false, connected: false, configured: true, connection: null }; paint(); toast('Google Calendar desconectado'); }
-        catch (error) { toast(error.message, 'err'); }
-      });
-    }
     if (act === 'notifications') {
       if (!('Notification' in window)) return toast('Este navegador no admite notificaciones', 'err');
       Notification.requestPermission().then((permission) => {
@@ -1156,7 +1088,7 @@ export async function render(container) {
         const ev = state.events.find((x) => x.id === item.id);
         const duration = minutesOf(ev.end_time) - minutesOf(ev.start_time);
         return Agenda.update(ev.id, { event_date: slot.dataset.date, start_time: slot.dataset.time,
-          end_time: timeFromMinutes(minutesOf(slot.dataset.time) + duration), ...(state.google.connected ? { sync_status: 'pending' } : {}) }).then(() => reload()).then(() => toast('Compromiso movido'));
+          end_time: timeFromMinutes(minutesOf(slot.dataset.time) + duration) }).then(() => reload()).then(() => toast('Compromiso movido'));
       }
       const task = state.tasks.find((t) => t.id === item.id);
       return patchTask(item.id, { scheduled_date: slot.dataset.date, scheduled_time: slot.dataset.time,
@@ -1254,7 +1186,7 @@ export async function render(container) {
       if (!ev) return;
       const duration = minutesOf(ev.end_time) - minutesOf(ev.start_time);
       Agenda.update(item.id, { event_date: slot.dataset.date, start_time: slot.dataset.time,
-        end_time: timeFromMinutes(minutesOf(slot.dataset.time) + duration), ...(state.google.connected ? { sync_status: 'pending' } : {}) }).then(() => reload()).then(() => toast('Compromiso movido')).catch(() => toast('No se pudo mover', 'err'));
+        end_time: timeFromMinutes(minutesOf(slot.dataset.time) + duration) }).then(() => reload()).then(() => toast('Compromiso movido')).catch(() => toast('No se pudo mover', 'err'));
     }
   });
 
