@@ -23,7 +23,7 @@ const SECTIONS = [
   { id: 'tareas', icon: ICONS.grid, label: 'Tareas' },
   { id: 'agenda', icon: ICONS.week, label: 'Agenda' },
   { id: 'proyectos', icon: ICONS.folder, label: 'Proyectos' },
-  { id: 'recordatorios', icon: ICONS.note, label: 'Recordatorios' },
+  { id: 'recordatorios', icon: ICONS.note, label: 'Notas' },
 ];
 
 const QUADS = {
@@ -34,14 +34,15 @@ const QUADS = {
 };
 
 const DURATIONS = [30, 60, 90, 120, 150, 180, 210, 240];
-const NOTE_COLORS = ['#ffd523', '#a8ff1e', '#8bd8ff', '#ff9ecb', '#d5b8ff', '#ffb37a'];
+// Paleta del sitio: los mismos tonos que ya usan la agenda y las cuatro cuadrantes.
+const EVENT_COLORS = ['#5b4bd6', '#ff4fab', '#42a5ff', '#1f9e4b', '#f5d93a', '#e08a3f', '#e8557f', '#7b5fe0'];
 
 const DIAS_LARGOS = ['DOMINGO', 'LUNES', 'MARTES', 'MIÉRCOLES', 'JUEVES', 'VIERNES', 'SÁBADO'];
 const DIAS_CORTOS = ['DOM', 'LUN', 'MAR', 'MIÉ', 'JUE', 'VIE', 'SÁB'];
 const MESES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio',
   'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
 
-const SLOT_H = 34;
+const HOUR_H = 64;
 const DAY_START = 6;
 const DAY_END = 23;
 
@@ -363,38 +364,53 @@ function viewAgenda() {
 
   const head = days.map((iso, i) => {
     const d = dateAt(iso);
-    return `<th class="${iso === today ? 'is-today' : ''}">${DIAS_CORTOS[i]}<b>${d.getDate()}</b></th>`;
+    return `<div class="tgCalHeadDay ${iso === today ? 'is-today' : ''}">${DIAS_CORTOS[i]}<b>${d.getDate()}</b></div>`;
   }).join('');
 
-  const rows = [];
-  for (let m = DAY_START * 60; m < DAY_END * 60; m += 30) {
-    const label = fmtTime(timeFromMinutes(m));
-    const cells = days.map((iso) => {
-      const items = dayItems(iso).filter((it) => minutesOf(it.start) === m);
-      const inner = items.map((it) => {
-        const span = Math.max(1, Math.round((minutesOf(it.end) - minutesOf(it.start)) / 30));
-        const h = span * SLOT_H - 5;
-        if (it.kind === 'event') {
-          return `<div class="tgEvent" data-event="${it.id}" data-date="${iso}" draggable="true" style="height:${h}px;border-left-color:${esc(it.color)}">
+  const bodyHeight = (DAY_END - DAY_START) * HOUR_H;
+  const hourLabels = Array.from({ length: DAY_END - DAY_START }, (_, i) => DAY_START + i)
+    .map((h) => `<div class="tgCalHourLabel" style="height:${HOUR_H}px">${esc(fmtTime(`${pad2(h)}:00`))}</div>`).join('');
+
+  const nowDate = new Date();
+  const nowMin = nowDate.getHours() * 60 + nowDate.getMinutes();
+
+  const dayCols = days.map((iso) => {
+    const blocks = dayItems(iso).map((it) => {
+      const startMin = Math.max(DAY_START * 60, minutesOf(it.start));
+      const endMin = Math.min(DAY_END * 60, Math.max(startMin + 15, minutesOf(it.end)));
+      const top = ((startMin - DAY_START * 60) / 60) * HOUR_H;
+      const height = Math.max(22, ((endMin - startMin) / 60) * HOUR_H - 3);
+      const durLabel = esc(fmtDuration(minutesOf(it.end) - minutesOf(it.start)));
+      if (it.kind === 'event') {
+        return `<div class="tgEvent" data-event="${it.id}" data-date="${iso}" draggable="true"
+              style="top:${top}px;height:${height}px;border-left-color:${esc(it.color)}">
             <small>${esc(fmtTime(it.start))} → ${esc(fmtTime(it.end))}</small>
             <b>${esc(it.title)}</b>
-            <i>${esc(fmtDuration(minutesOf(it.end) - minutesOf(it.start)))}</i>
+            <i>${durLabel}</i>
             <button class="tgEventMove" data-act="pickevent" aria-label="Mover compromiso">✥</button>
           </div>`;
-        }
-        return `<div class="tgEvent tgEvent--task q${it.quad || 4} ${it.done ? 'is-done' : ''}"
-                     data-task="${it.id}" draggable="true" style="height:${h}px">
+      }
+      return `<div class="tgEvent tgEvent--task q${it.quad || 4} ${it.done ? 'is-done' : ''}"
+              data-task="${it.id}" draggable="true" style="top:${top}px;height:${height}px">
           <button class="tgEventDone" type="button" data-act="toggle" aria-label="Completar">✓</button>
           <small>${esc(fmtTime(it.start))}</small>
           <b>${esc(it.title)}</b>
-          <i>${esc(fmtDuration(minutesOf(it.end) - minutesOf(it.start)))}</i>
-          <span class="tgResize"><button data-act="shrink" aria-label="Reducir 30 minutos">−</button><button data-act="grow" aria-label="Aumentar 30 minutos">＋</button></span>
+          <i>${durLabel}</i>
+          <button class="tgEventMove" data-act="pickmove" aria-label="Mover tarea">✥</button>
         </div>`;
-      }).join('');
-      return `<td class="tgSlot" data-date="${iso}" data-time="${timeFromMinutes(m)}">${inner}</td>`;
     }).join('');
-    rows.push(`<tr><th class="tgHour">${esc(label)}</th>${cells}</tr>`);
-  }
+
+    const slots = [];
+    for (let m = DAY_START * 60; m < DAY_END * 60; m += 30) {
+      const top = ((m - DAY_START * 60) / 60) * HOUR_H;
+      slots.push(`<div class="tgSlot" data-date="${iso}" data-time="${timeFromMinutes(m)}" style="top:${top}px;height:${HOUR_H / 2}px"></div>`);
+    }
+
+    const nowLine = (iso === today && nowMin >= DAY_START * 60 && nowMin <= DAY_END * 60)
+      ? `<div class="tgNowLine" style="top:${((nowMin - DAY_START * 60) / 60) * HOUR_H}px"></div>` : '';
+
+    return `<div class="tgCalDay ${iso === today ? 'is-today' : ''}" style="height:${bodyHeight}px">${slots.join('')}${nowLine}${blocks}</div>`;
+  }).join('');
 
   return html`
     ${raw(statsHTML())}
@@ -404,7 +420,7 @@ function viewAgenda() {
         <button class="tgArrow" type="button" data-act="prevweek" aria-label="Semana anterior">‹</button>
         <div>
           <div class="tgMonthName">${monthLabel}</div>
-          <div class="tgMonthSub">Domingo a sábado · bloques de 30 minutos</div>
+          <div class="tgMonthSub">Domingo a sábado · bloques de 1 hora</div>
         </div>
         <button class="tgArrow" type="button" data-act="nextweek" aria-label="Semana siguiente">›</button>
       </div>
@@ -424,10 +440,16 @@ function viewAgenda() {
       </aside>
 
       <div class="tgGridWrap">
-        <table class="tgGrid">
-          <thead><tr><th class="tgHour">HORA</th>${raw(head)}</tr></thead>
-          <tbody>${raw(rows.join(''))}</tbody>
-        </table>
+        <div class="tgCal" style="--hourh:${HOUR_H}px">
+          <div class="tgCalHead">
+            <div class="tgCalHeadGutter"></div>
+            ${raw(head)}
+          </div>
+          <div class="tgCalBody">
+            <div class="tgCalHours" style="height:${bodyHeight}px">${raw(hourLabels)}</div>
+            <div class="tgCalDays">${raw(dayCols)}</div>
+          </div>
+        </div>
       </div>
     </div>
     <section class="tgWeekPlan">
@@ -487,11 +509,11 @@ function viewProyectos() {
     <div class="tgProjList">${raw(cards || '<div class="tgQuadEmpty">Aún no hay proyectos.</div>')}</div>`;
 }
 
-function viewRecordatorios() {
+function viewNotas() {
   const q = state.noteQuery.trim().toLocaleLowerCase('es');
   const visible = state.notes.filter((n) => !q || n.body.toLocaleLowerCase('es').includes(q));
   const notes = visible.map((n) => html`
-    <article class="tgNote" data-note="${n.id}" style="background:${n.color}">
+    <article class="tgNote" data-note="${n.id}">
       <textarea data-act="notebody" placeholder="Escribe…">${n.body}</textarea>
       <div class="tgNoteMeta">${n.remind_at ? `⏰ ${esc(new Date(n.remind_at).toLocaleString('es-CO', { dateStyle: 'medium', timeStyle: 'short' }))}` : 'Sin aviso'}${n.notification_enabled ? ' · notificación activa' : ''}</div>
       <div class="tgNoteFoot">
@@ -502,11 +524,11 @@ function viewRecordatorios() {
     </article>`).join('');
 
   return html`
-    <div class="tgReminderTools"><label>Buscar recordatorios <input class="input" id="tgNoteSearch" type="search" value="${state.noteQuery}" placeholder="Texto de la nota"></label>
+    <div class="tgReminderTools"><label>Buscar notas <input class="input" id="tgNoteSearch" type="search" value="${state.noteQuery}" placeholder="Texto de la nota"></label>
       <button class="tgBtn tgBtn--plain tgBtn--sm" type="button" data-act="notifications">ACTIVAR NOTIFICACIONES</button></div>
     <form class="tgNoteNew" id="tgNoteNew">
       <textarea id="tgNoteInput" placeholder="¿Qué necesitas recordar o pensar?"></textarea>
-      <button class="tgBtn" type="submit">PEGAR NOTA</button>
+      <button class="tgBtn" type="submit">AGREGAR NOTA</button>
     </form>
     <div class="tgNotes">${raw(notes || '<div class="tgQuadEmpty">Sin notas todavía.</div>')}</div>`;
 }
@@ -519,11 +541,11 @@ function paint() {
   const kicker = `// ${DIAS_LARGOS[today.getDay()]}, ${today.getDate()} DE ${MESES[today.getMonth()].toUpperCase()}`;
   const titles = {
     tareas: 'TAREAS', hoy: 'HOY', agenda: 'AGENDA',
-    proyectos: 'PROYECTOS', recordatorios: 'RECORDATORIOS',
+    proyectos: 'PROYECTOS', recordatorios: 'NOTAS',
   };
   const views = {
     tareas: viewTareas, hoy: viewHoy, agenda: viewAgenda,
-    proyectos: viewProyectos, recordatorios: viewRecordatorios,
+    proyectos: viewProyectos, recordatorios: viewNotas,
   };
 
   main.innerHTML = html`
@@ -664,7 +686,10 @@ function taskSheet(task) {
       </div>
 
       <div class="field"><label>Fecha límite</label>
-        <input class="input" id="k-due" type="date" value="${t.due_date || ''}"></div>
+        <div class="tgDateField">
+          <input class="input" id="k-due" type="date" value="${t.due_date || ''}">
+          <button type="button" class="tgDateBtn" id="k-due-pick" aria-label="Elegir fecha en el calendario">📅</button>
+        </div></div>
 
       <div class="grid2">
         <div class="field"><label>Repetición</label><select class="select" id="k-rec">
@@ -712,6 +737,11 @@ function taskSheet(task) {
           const b = e.currentTarget;
           b.setAttribute('aria-pressed', String(b.getAttribute('aria-pressed') !== 'true'));
         });
+      });
+      $('#k-due-pick', r).addEventListener('click', () => {
+        const input = $('#k-due', r);
+        if (input.showPicker) input.showPicker();
+        else input.focus();
       });
     },
   });
@@ -784,7 +814,11 @@ function eventSheet(ev, occurrenceDate = ev?.event_date) {
             <option value="monthly" ${e.recurrence === 'monthly' ? 'selected' : ''}>Cada mes</option>
           </select></div>
         <div class="field"><label>Color</label>
-          <input class="input" id="e-color" type="color" value="${e.color}" style="height:48px;padding:4px"></div>
+          <div class="tgColorPick" id="e-color-pick">
+            ${raw(EVENT_COLORS.map((c) => `<button type="button" class="tgColorSwatch ${c === e.color ? 'is-on' : ''}"
+              data-c="${c}" style="background:${c}" aria-label="Color ${c}"></button>`).join(''))}
+          </div>
+          <input type="hidden" id="e-color" value="${e.color}"></div>
       </div>
       <div class="field"><label>Repetir hasta (opcional)</label>
         <input class="input" id="e-until" type="date" value="${e.repeat_until || ''}"></div>
@@ -834,6 +868,12 @@ function eventSheet(ev, occurrenceDate = ev?.event_date) {
         },
       },
     ],
+    onOpen: ({ root: r }) => {
+      $$('.tgColorSwatch', r).forEach((btn) => btn.addEventListener('click', () => {
+        $('#e-color', r).value = btn.dataset.c;
+        $$('.tgColorSwatch', r).forEach((x) => x.classList.toggle('is-on', x === btn));
+      }));
+    },
   });
 }
 
@@ -887,7 +927,7 @@ function projectSheet(proj) {
 
 function noteSheet(note) {
   sheet({
-    title: 'Aviso del recordatorio',
+    title: 'Aviso de la nota',
     body: html`
       <p class="sheetText"><b>${note.body}</b></p>
       <div class="field"><label>Fecha y hora (opcional)</label><input class="input" id="n-remind" type="datetime-local" value="${note.remind_at ? note.remind_at.slice(0, 16) : ''}"></div>
@@ -922,7 +962,10 @@ function checkNotifications() {
   });
 }
 
+let renderGen = 0;
+
 export async function render(container) {
+  const myGen = ++renderGen;
   root = container;
   document.body.dataset.skin = 'taskgrid';
   state.section = sectionFromHash();
@@ -955,6 +998,10 @@ export async function render(container) {
 
   paint();
   await reload({ silent: true });
+  // Si otra llamada a render() empezó mientras esta esperaba (por ejemplo, al
+  // volver de segundo plano), esta pasada quedó obsoleta: no engancha listeners
+  // encima de los que ya puso la más reciente.
+  if (myGen !== renderGen) return;
 
   $('.tgNav', root).addEventListener('click', (e) => {
     const b = e.target.closest('[data-section]');
@@ -988,7 +1035,7 @@ export async function render(container) {
       const body = ta.value.trim();
       if (!body) return;
       ta.value = '';
-      Notes.create({ body, color: NOTE_COLORS[state.notes.length % NOTE_COLORS.length], profile_id: perfilActivo()?.id || null })
+      Notes.create({ body, profile_id: perfilActivo()?.id || null })
         .then(() => reload()).catch(() => toast('No se pudo pegar la nota', 'err'));
     }
   });
@@ -1104,16 +1151,15 @@ export async function render(container) {
     if (act === 'edit') return taskSheet(task);
     if (act === 'schedule') return scheduleSheet(task);
     if (act === 'timer') return toggleTimer(task);
-    if (act === 'shrink' || act === 'grow') {
-      const duration = Math.max(30, Math.min(240, Number(task.duration_min || 30) + (act === 'grow' ? 30 : -30)));
-      return patchTask(task.id, { duration_min: duration }, `Duración: ${fmtDuration(duration)}`);
-    }
 
     if (taskEl.closest('.tgEvent--task')) {
-      state.picked = state.picked?.id === task.id ? null : { kind: 'task', id: task.id };
-      paint();
-      if (state.picked) toast('Ahora toca otra casilla de la agenda');
-      return;
+      if (act === 'pickmove') {
+        state.picked = state.picked?.id === task.id ? null : { kind: 'task', id: task.id };
+        paint();
+        if (state.picked) toast('Ahora toca otra casilla de la agenda');
+        return;
+      }
+      return taskSheet(task);
     }
 
     if (taskEl.closest('.tgDragBody')) {

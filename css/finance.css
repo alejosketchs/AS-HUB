@@ -170,6 +170,12 @@ body[data-skin="finanzas"] .toast{background:var(--fn-lime)}
 .finSeg button[aria-pressed="true"]{background:var(--fn-ink);color:var(--fn-lime)}
 .finRowTwo{display:grid;gap:14px;grid-template-columns:1fr 1fr}
 @media(max-width:560px){.finRowTwo{grid-template-columns:1fr}}
+.finFieldRow{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}
+.finFieldRow .finField{min-width:0}
+.finFieldRow>.finBtn{height:41px}
+.finCheckbox{display:flex;align-items:center;gap:10px;font:650 13.5px var(--sans);color:var(--fn-ink);cursor:pointer}
+.finCheckbox input{width:20px;height:20px;accent-color:var(--fn-lime);border:2px solid var(--fn-ink)}
+html[data-theme="dark"] .finCheckbox{color:#f4efe6}
 .finProfiles{display:grid;gap:12px}
 .finProfile{display:flex;align-items:center;gap:12px;padding:12px 14px;background:#fff;border:3px solid var(--fn-ink);text-align:left}
 .finProfile[aria-current="true"]{background:var(--fn-lime)}

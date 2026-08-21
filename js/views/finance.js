@@ -231,16 +231,19 @@ function weekRhythm() {
   const week = state.tx.filter((t) => t.type === 'expense'
     && t.transaction_date >= start && t.transaction_date <= end);
 
-  const items = state.budgets.filter((b) => b.kind === 'variable' && b.active !== false).map((b) => {
-    const key = norm(b.name);
-    const spent = sumBy(week.filter((t) => {
-      const c = catById(t.category_id); const s = subById(t.subcategory_id);
-      return norm(c?.name) === key || norm(s?.name) === key;
-    }), (t) => t.amount);
+  const items = state.budgets.filter((b) => b.is_weekly && b.active !== false).map((b) => {
+    const spent = sumBy(week.filter((t) => t.category_id === b.category_id), (t) => t.amount);
     const weekly = Math.round(n(b.amount) / WEEKS_PER_MONTH);
     return { name: b.name, spent, weekly, over: spent > weekly };
   });
   return { start, end, items };
+}
+
+function spendTypeFor(type, categoryId) {
+  if (type === 'income') return 'income';
+  const b = state.budgets.find((x) => x.category_id === categoryId
+    && x.active !== false && (x.kind === 'fixed' || x.kind === 'variable'));
+  return b ? b.kind : 'variable';
 }
 
 function viewPresupuesto() {
@@ -299,6 +302,7 @@ function viewPresupuesto() {
             <h2>Presupuesto semanal</h2>
             <p>Semana actual · ${fmtLongDay(rhythm.start)} — ${fmtLongDay(rhythm.end)}</p>
           </div>
+          <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act="week-pick">Elegir categorías</button>
         </div>
         ${rhythm.items.length ? raw(`<div class="finWeek">${rhythm.items.map((it) => {
     const p2 = it.weekly ? Math.round((it.spent / it.weekly) * 100) : 0;
@@ -351,13 +355,12 @@ function viewAhorros() {
 }
 
 function viewCategorias() {
-  const section = (kind) => {
-    const cats = state.cats.filter((c) => c.kind === kind);
+  const section = (title, emoji, cats, kindForNew) => {
     return html`
       <section class="finCatSection">
         <div class="finCatHead">
-          <h3>${KINDS[kind].emoji} ${KINDS[kind].label}</h3>
-          <button class="finBtn finBtn--sm" type="button" data-act="cat-new" data-kind="${kind}">+ Categoría</button>
+          <h3>${emoji} ${title}</h3>
+          <button class="finBtn finBtn--sm" type="button" data-act="cat-new" data-kind="${kindForNew}">+ Categoría</button>
         </div>
         ${cats.length ? raw(`<div class="finCats">${cats.map((c) => {
       const subs = state.subs.filter((s) => s.category_id === c.id);
@@ -387,7 +390,8 @@ function viewCategorias() {
       <div class="finPanelHead">
         <div><span class="finTag">Mapa de gastos</span><h2>Categorías</h2></div>
       </div>
-      ${raw(section('fixed'))}${raw(section('variable'))}${raw(section('income'))}
+      ${raw(section('Gastos', '💸', state.cats.filter((c) => c.kind === 'fixed' || c.kind === 'variable'), 'variable'))}
+      ${raw(section('Ingresos', KINDS.income.emoji, state.cats.filter((c) => c.kind === 'income'), 'income'))}
     </div>`;
 }
 
@@ -921,7 +925,6 @@ function txSheet(tx) {
     date: tx?.transaction_date || todayISO(),
     category_id: tx?.category_id || '',
     subcategory_id: tx?.subcategory_id || '',
-    spend_type: tx?.spend_type || 'variable',
     description: tx?.description || '',
   };
 
@@ -939,15 +942,16 @@ function txSheet(tx) {
           <button type="button" data-v="income" aria-pressed="${data.type === 'income'}">Ingreso</button>
         </div>
         ${raw(field('Monto', `<input type="text" inputmode="numeric" autocomplete="off" data-f="amount" value="${formatCOPInput(data.amount)}" placeholder="$0">`))}
-        <div class="finRowTwo">
-          ${raw(field('Fecha', `<input type="date" data-f="date" value="${data.date}">`))}
-          ${raw(field('Tipo de gasto', `<select data-f="spend_type">
-            <option value="variable" ${data.spend_type !== 'fixed' ? 'selected' : ''}>Variable</option>
-            <option value="fixed" ${data.spend_type === 'fixed' ? 'selected' : ''}>Fijo</option></select>`))}
-        </div>
-        ${raw(field('Categoría', `<select data-f="category_id"><option value="">— elige —</option>${
+        ${raw(field('Fecha', `<input type="date" data-f="date" value="${data.date}">`))}
+        <div class="finFieldRow">
+          ${raw(field('Categoría', `<select data-f="category_id"><option value="">— elige —</option>${
   optionList(catOpts(data.type), data.category_id, (c) => ({ value: c.id, label: `${c.emoji || ''} ${c.name}` }))}</select>`))}
-        ${raw(field('Subcategoría', '<select data-f="subcategory_id"><option value="">— elige —</option></select>'))}
+          <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act-local="cat-edit" aria-label="Modificar categoría">✎</button>
+        </div>
+        <div class="finFieldRow">
+          ${raw(field('Subcategoría', '<select data-f="subcategory_id"><option value="">— elige —</option></select>'))}
+          <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act-local="sub-edit" aria-label="Modificar subcategoría">✎</button>
+        </div>
         ${raw(field('Descripción', `<input type="text" data-f="description" value="${esc(data.description)}" placeholder="Opcional">`))}
       </div>`,
     onOpen: ({ root: r, close }) => {
@@ -975,15 +979,28 @@ function txSheet(tx) {
       }));
       get('category_id').addEventListener('change', () => { data.subcategory_id = ''; paintSubs(); });
 
+      $('[data-act-local="cat-edit"]', r).addEventListener('click', () => {
+        const cat = catById(get('category_id').value);
+        if (!cat) return toast('Elige una categoría primero', 'err');
+        categorySheet(cat, null, () => { data.category_id = cat.id; paintCats(); });
+      });
+      $('[data-act-local="sub-edit"]', r).addEventListener('click', () => {
+        const sub = subById(get('subcategory_id').value);
+        const catId = get('category_id').value;
+        if (!sub) return toast('Elige una subcategoría primero', 'err');
+        subSheet(catId, sub, () => { data.subcategory_id = sub.id; paintSubs(); });
+      });
+
       r.__save = async () => {
+        const categoryId = get('category_id').value || null;
         const payload = {
           profile_id: state.profileId,
           type: data.type,
           amount: parseCOP(get('amount').value),
           transaction_date: get('date').value || todayISO(),
-          category_id: get('category_id').value || null,
+          category_id: categoryId,
           subcategory_id: get('subcategory_id').value || null,
-          spend_type: get('spend_type').value,
+          spend_type: spendTypeFor(data.type, categoryId),
           description: get('description').value.trim(),
         };
         if (!Number.isSafeInteger(payload.amount) || payload.amount <= 0) {
@@ -1008,7 +1025,7 @@ function txSheet(tx) {
   });
 }
 
-function simpleSheet({ title, fields, onSave }) {
+function simpleSheet({ title, fields, onSave, onSaved }) {
   sheet({
     title,
     body: html`<div class="finForm">${raw(fields.map((f) => {
@@ -1034,12 +1051,147 @@ function simpleSheet({ title, fields, onSave }) {
           close();
           await loadAll({ silent: true });
           toast('Guardado');
+          onSaved?.();
         } catch { toast('No se pudo guardar', 'err'); }
       };
     },
     actions: [
       { label: 'Cancelar', onClick: ({ close }) => close() },
       { label: 'Guardar', variant: 'primary', onClick: ({ root: r }) => r.__save?.() },
+    ],
+  });
+}
+
+function categorySheet(cat, kindHint, onSaved) {
+  const kind = cat?.kind || kindHint || 'variable';
+  return simpleSheet({
+    title: cat ? 'Editar categoría' : 'Nueva categoría',
+    fields: [
+      { key: 'emoji', label: 'Emoji', value: cat?.emoji || '📦' },
+      { key: 'name', label: 'Nombre', value: cat?.name || '' },
+    ],
+    onSave: (v) => {
+      const payload = { name: v.name.trim(), emoji: v.emoji.trim() || '📦', kind };
+      if (cat) return Finance.updateCategory(cat.id, payload);
+      return Finance.addCategory({ ...payload, slug: norm(v.name).replace(/\s+/g, '-') });
+    },
+    onSaved,
+  });
+}
+
+function subSheet(catId, sub, onSaved) {
+  return simpleSheet({
+    title: sub ? 'Editar subcategoría' : 'Nueva subcategoría',
+    fields: [
+      { key: 'emoji', label: 'Emoji', value: sub?.emoji || '•' },
+      { key: 'name', label: 'Nombre', value: sub?.name || '' },
+    ],
+    onSave: (v) => {
+      const payload = { name: v.name.trim(), emoji: v.emoji.trim() || '•' };
+      return sub ? Finance.updateSub(sub.id, payload) : Finance.addSub({ ...payload, category_id: catId });
+    },
+    onSaved,
+  });
+}
+
+function budgetSheet(b) {
+  const data = {
+    category_id: b?.category_id || '',
+    kind: b?.kind || 'fixed',
+    amount: b ? n(b.amount) : '',
+    is_weekly: !!b?.is_weekly,
+  };
+  const catOpts = () => state.cats.filter((c) => c.kind === 'fixed' || c.kind === 'variable');
+
+  sheet({
+    title: b ? 'Editar obligación' : 'Nueva obligación',
+    body: html`
+      <div class="finForm">
+        ${raw(field('Categoría', `<select data-f="category_id"><option value="">— elige —</option>${
+  optionList(catOpts(), data.category_id, (c) => ({ value: c.id, label: `${c.emoji || ''} ${c.name}` }))}</select>`))}
+        ${raw(field('Monto del mes', `<input type="text" inputmode="numeric" autocomplete="off" data-f="amount" data-money value="${formatCOPInput(data.amount)}" placeholder="$0">`))}
+        ${raw(field('Grupo', `<select data-f="kind">
+          <option value="fixed" ${data.kind === 'fixed' ? 'selected' : ''}>Gasto fijo</option>
+          <option value="variable" ${data.kind === 'variable' ? 'selected' : ''}>Gasto variable</option>
+          <option value="saving" ${data.kind === 'saving' ? 'selected' : ''}>Ahorro</option>
+        </select>`))}
+        <label class="finCheckbox">
+          <input type="checkbox" data-f="is_weekly" ${data.is_weekly ? 'checked' : ''}>
+          <span>Contar en el presupuesto semanal</span>
+        </label>
+      </div>`,
+    onOpen: ({ root: r, close }) => {
+      const get = (f) => $(`[data-f="${f}"]`, r);
+      bindCOPInput(get('amount'));
+      r.__save = async () => {
+        const catId = get('category_id').value;
+        const cat = catById(catId);
+        if (!cat) return toast('Elige una categoría', 'err');
+        const amount = parseCOP(get('amount').value);
+        if (!Number.isFinite(amount) || amount < 0) return toast('Escribe un monto válido', 'err');
+        const payload = {
+          profile_id: state.profileId,
+          category_id: cat.id,
+          name: cat.name,
+          kind: get('kind').value,
+          amount,
+          is_weekly: get('is_weekly').checked,
+        };
+        try {
+          if (b) await Finance.updateBudget(b.id, payload);
+          else await Finance.addBudget(payload);
+          close();
+          await loadAll({ silent: true });
+          toast(b ? 'Obligación actualizada' : 'Obligación guardada');
+        } catch { toast('No se pudo guardar', 'err'); }
+      };
+    },
+    actions: [
+      { label: 'Cancelar', onClick: ({ close }) => close() },
+      { label: 'Guardar', variant: 'primary', onClick: ({ root: r }) => r.__save?.() },
+    ],
+  });
+}
+
+function weekPickSheet() {
+  const options = state.budgets.filter((x) => x.active !== false && (x.kind === 'fixed' || x.kind === 'variable'));
+  const picked = new Map(options.map((b) => [b.id, !!b.is_weekly]));
+  const rowHTML = (b) => `
+    <button class="finCheck ${picked.get(b.id) ? 'is-done' : ''}" type="button" data-wk="${b.id}">
+      <span class="finCheckBox">✓</span>
+      <span class="finCheckText"><b>${esc(b.name)}</b><small>${esc(KINDS[b.kind]?.label || b.kind)}</small></span>
+      <span class="finCheckAmt">${money(b.amount)}</span>
+    </button>`;
+
+  sheet({
+    title: 'Presupuesto semanal',
+    body: html`
+      <p class="sheetText">Elige qué obligaciones, fijas o variables, quieres seguir semana a semana.</p>
+      ${options.length
+    ? H`<div class="finChecks">${raw(options.map(rowHTML).join(''))}</div>`
+    : H`<div class="finEmpty">Agrega obligaciones primero.</div>`}`,
+    onOpen: ({ root: r }) => {
+      $$('[data-wk]', r).forEach((btn) => btn.addEventListener('click', () => {
+        const id = btn.dataset.wk;
+        picked.set(id, !picked.get(id));
+        btn.classList.toggle('is-done', picked.get(id));
+      }));
+    },
+    actions: [
+      { label: 'Cancelar', onClick: ({ close }) => close() },
+      {
+        label: 'Guardar',
+        variant: 'primary',
+        onClick: async ({ close }) => {
+          const changed = options.filter((b) => picked.get(b.id) !== !!b.is_weekly);
+          try {
+            await Promise.all(changed.map((b) => Finance.updateBudget(b.id, { is_weekly: picked.get(b.id) })));
+            close();
+            await loadAll({ silent: true });
+            toast('Presupuesto semanal actualizado');
+          } catch { toast('No se pudo guardar', 'err'); }
+        },
+      },
     ],
   });
 }
@@ -1056,6 +1208,9 @@ function shiftMonth(delta) {
 }
 
 function wire() {
+  if (root.dataset.finWired) return;
+  root.dataset.finWired = '1';
+
   root.addEventListener('change', (e) => {
     if (e.target.dataset.act === 'period') { state.period = e.target.value; paint(); }
   });
@@ -1106,6 +1261,7 @@ function wire() {
     if (act === 'prev') return shiftMonth(-1);
     if (act === 'next') return shiftMonth(1);
     if (act === 'tools') return accionMenu('pdf');
+    if (act === 'week-pick') return weekPickSheet();
 
     if (act === 'base') {
       return simpleSheet({
@@ -1131,31 +1287,7 @@ function wire() {
     if (act === 'bud-new' || act === 'bud-edit') {
       const id = btn.closest('[data-budget]')?.dataset.budget;
       const b = state.budgets.find((x) => x.id === id);
-      return simpleSheet({
-        title: b ? 'Editar obligación' : 'Nueva obligación',
-        fields: [
-          { key: 'name', label: 'Nombre', value: b?.name || '', placeholder: 'Arriendo, Mercado…' },
-          { key: 'amount', label: 'Monto del mes', type: 'number', value: b ? n(b.amount) : '' },
-          {
-            key: 'kind',
-            label: 'Grupo',
-            type: 'select',
-            value: b?.kind || 'fixed',
-            options: [
-              { value: 'fixed', label: 'Gasto fijo' },
-              { value: 'variable', label: 'Gasto variable' },
-              { value: 'saving', label: 'Ahorro' },
-            ],
-          },
-        ],
-        onSave: (v) => {
-          const payload = {
-            profile_id: state.profileId, name: v.name.trim(), amount: n(v.amount),
-            kind: v.kind,
-          };
-          return b ? Finance.updateBudget(b.id, payload) : Finance.addBudget(payload);
-        },
-      });
+      return budgetSheet(b);
     }
     if (act === 'bud-del') {
       const id = btn.closest('[data-budget]').dataset.budget;
@@ -1203,19 +1335,7 @@ function wire() {
     if (act === 'cat-new' || act === 'cat-edit') {
       const id = btn.closest('[data-cat]')?.dataset.cat;
       const c = state.cats.find((x) => x.id === id);
-      const kind = c?.kind || btn.dataset.kind || 'variable';
-      return simpleSheet({
-        title: c ? 'Editar categoría' : 'Nueva categoría',
-        fields: [
-          { key: 'emoji', label: 'Emoji', value: c?.emoji || '📦' },
-          { key: 'name', label: 'Nombre', value: c?.name || '' },
-        ],
-        onSave: (v) => {
-          const payload = { name: v.name.trim(), emoji: v.emoji.trim() || '📦', kind };
-          if (c) return Finance.updateCategory(c.id, payload);
-          return Finance.addCategory({ ...payload, slug: norm(v.name).replace(/\s+/g, '-') });
-        },
-      });
+      return categorySheet(c, btn.dataset.kind);
     }
     if (act === 'cat-del') {
       const id = btn.closest('[data-cat]').dataset.cat;
@@ -1228,17 +1348,7 @@ function wire() {
       const catId = btn.closest('[data-cat]').dataset.cat;
       const id = btn.closest('[data-sub]')?.dataset.sub;
       const s = state.subs.find((x) => x.id === id);
-      return simpleSheet({
-        title: s ? 'Editar subcategoría' : 'Nueva subcategoría',
-        fields: [
-          { key: 'emoji', label: 'Emoji', value: s?.emoji || '•' },
-          { key: 'name', label: 'Nombre', value: s?.name || '' },
-        ],
-        onSave: (v) => {
-          const payload = { name: v.name.trim(), emoji: v.emoji.trim() || '•' };
-          return s ? Finance.updateSub(s.id, payload) : Finance.addSub({ ...payload, category_id: catId });
-        },
-      });
+      return subSheet(catId, s);
     }
     if (act === 'sub-del') {
       const id = btn.closest('[data-sub]').dataset.sub;

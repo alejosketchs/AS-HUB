@@ -79,7 +79,7 @@ function shell(nombre) {
       <footer class="hubFoot">
         <div>
           <b>AS SUITE</b>
-          <small>Hecho para un solo usuario: tú.</small>
+          <small>Hecho para Shori y Toli.</small>
         </div>
         <div class="hubFootMeta">
           <span>versión <b>${APP_VERSION}</b></span>
