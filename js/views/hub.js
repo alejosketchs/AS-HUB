@@ -7,6 +7,10 @@ import {
 import { FRASES, SITIOS_EXTRA, APP_VERSION, BUILD_DATE } from '../config.js';
 import { linkConSesion, perfilActivo } from '../session.js';
 
+/* Reader Tracker vive en su propio sitio (mismo Supabase, mismo login PIN).
+   Aquí solo se enlaza con la sesión puesta para que no pida PIN otra vez. */
+const READER_URL = 'https://as-reader-as24-b7b9.vercel.app/';
+
 function fraseDelDia() {
   const iso = todayISO();
   const seed = Number(iso.replaceAll('-', '')) % FRASES.length;
@@ -67,6 +71,16 @@ function shell(nombre) {
           <h2>Finanzas</h2>
           <p>Movimientos, presupuesto, check list mensual, metas y deudas. Un perfil para cada uno.</p>
           <div class="appStats">${raw(chip('Cargando…'))}</div>
+          <div class="appOpen">ABRIR <b>↗</b></div>
+        </a>
+
+        <a class="appCard tilt-a" href="${linkConSesion(READER_URL)}" target="_blank" rel="noopener" style="--accent:var(--wine)">
+          <span class="appNum">#03</span>
+          <div class="appIcon">R</div>
+          <p class="appLabel">LEE · AVANZA · SUBE DE NIVEL</p>
+          <h2>Reader Tracker</h2>
+          <p>Cada página suma XP, logros y una season mensual entre los dos.</p>
+          <div class="appStats">${raw(chip('Libros') + chip('XP') + chip('Logros'))}</div>
           <div class="appOpen">ABRIR <b>↗</b></div>
         </a>
       </div>
