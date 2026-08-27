@@ -788,9 +788,15 @@ function scheduleSheet(task) {
   });
 }
 
-function eventSheet(ev, occurrenceDate = ev?.event_date) {
+function eventSheet(ev, occurrenceDate = ev?.event_date, preset) {
   const isNew = !ev;
-  const e = ev || { title: '', event_date: todayISO(), start_time: '09:00', end_time: '10:00', color: '#42a5ff', recurrence: 'none', repeat_until: '' };
+  const e = ev || {
+    title: '',
+    event_date: preset?.date || todayISO(),
+    start_time: preset?.time || '09:00',
+    end_time: preset?.time ? timeFromMinutes(minutesOf(preset.time) + 60) : '10:00',
+    color: '#42a5ff', recurrence: 'none', repeat_until: '',
+  };
   sheet({
     title: isNew ? 'Nuevo compromiso' : 'Editar compromiso',
     body: html`
@@ -1128,18 +1134,22 @@ export async function render(container) {
     }
 
     const slot = e.target.closest('.tgSlot');
-    if (slot && state.picked && !e.target.closest('[data-task]')) {
-      const item = state.picked;
-      state.picked = null;
-      if (item.kind === 'event') {
-        const ev = state.events.find((x) => x.id === item.id);
-        const duration = minutesOf(ev.end_time) - minutesOf(ev.start_time);
-        return Agenda.update(ev.id, { event_date: slot.dataset.date, start_time: slot.dataset.time,
-          end_time: timeFromMinutes(minutesOf(slot.dataset.time) + duration) }).then(() => reload()).then(() => toast('Compromiso movido'));
+    if (slot && !e.target.closest('[data-task]')) {
+      if (state.picked) {
+        const item = state.picked;
+        state.picked = null;
+        if (item.kind === 'event') {
+          const ev = state.events.find((x) => x.id === item.id);
+          const duration = minutesOf(ev.end_time) - minutesOf(ev.start_time);
+          return Agenda.update(ev.id, { event_date: slot.dataset.date, start_time: slot.dataset.time,
+            end_time: timeFromMinutes(minutesOf(slot.dataset.time) + duration) }).then(() => reload()).then(() => toast('Compromiso movido'));
+        }
+        const task = state.tasks.find((t) => t.id === item.id);
+        return patchTask(item.id, { scheduled_date: slot.dataset.date, scheduled_time: slot.dataset.time,
+          reschedule_count: Number(task?.reschedule_count || 0) + (task?.scheduled_date ? 1 : 0) }, 'Agendada ✓');
       }
-      const task = state.tasks.find((t) => t.id === item.id);
-      return patchTask(item.id, { scheduled_date: slot.dataset.date, scheduled_time: slot.dataset.time,
-        reschedule_count: Number(task?.reschedule_count || 0) + (task?.scheduled_date ? 1 : 0) }, 'Agendada ✓');
+      // Casilla vacía tocada sin nada seleccionado: agenda un compromiso nuevo ahí mismo.
+      return eventSheet(null, null, { date: slot.dataset.date, time: slot.dataset.time });
     }
 
     const taskEl = e.target.closest('[data-task]');

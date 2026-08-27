@@ -108,6 +108,17 @@ function periodTx() {
 
 const sumBy = (list, f) => list.reduce((acc, x) => acc + n(f(x)), 0);
 
+/** Descripciones ya usadas, de la más frecuente a la menos, para autocompletar. */
+function descHistory() {
+  const seen = new Map();
+  state.tx.forEach((t) => {
+    const d = (t.description || '').trim();
+    if (!d) return;
+    seen.set(d, (seen.get(d) || 0) + 1);
+  });
+  return [...seen.entries()].sort((a, b) => b[1] - a[1]).map(([d]) => d).slice(0, 40);
+}
+
 function totals(list) {
   const income = sumBy(list.filter((t) => t.type === 'income'), (t) => t.amount);
   const expense = sumBy(list.filter((t) => t.type === 'expense'), (t) => t.amount);
@@ -952,7 +963,8 @@ function txSheet(tx) {
           ${raw(field('Subcategoría', '<select data-f="subcategory_id"><option value="">— elige —</option></select>'))}
           <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act-local="sub-edit" aria-label="Modificar subcategoría">✎</button>
         </div>
-        ${raw(field('Descripción', `<input type="text" data-f="description" value="${esc(data.description)}" placeholder="Opcional">`))}
+        ${raw(field('Descripción', `<input type="text" data-f="description" list="txDescList" autocomplete="off" value="${esc(data.description)}" placeholder="Opcional">`))}
+        ${raw(`<datalist id="txDescList">${descHistory().map((d) => `<option value="${esc(d)}">`).join('')}</datalist>`)}
       </div>`,
     onOpen: ({ root: r, close }) => {
       const get = (f) => $(`[data-f="${f}"]`, r);
@@ -1339,7 +1351,7 @@ function wire() {
     }
     if (act === 'cat-del') {
       const id = btn.closest('[data-cat]').dataset.cat;
-      return confirmSheet('Eliminar categoría', 'Se borra la categoría y sus subcategorías.', async () => {
+      return confirmSheet('Eliminar categoría', 'Se borra la categoría y sus subcategorías. Los movimientos que la tenían asignada quedan sin categoría.', async () => {
         try { await Finance.removeCategory(id); await loadAll({ silent: true }); toast('Categoría eliminada'); }
         catch { toast('No se pudo eliminar', 'err'); }
       });

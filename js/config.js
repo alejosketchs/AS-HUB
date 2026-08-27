@@ -33,19 +33,19 @@ export const SITIOS_EXTRA = [
   { key: 'arpegios', nombre: 'Arpegios', descripcion: 'Cuaderno de acordes y progresiones.', emoji: '🎸', accent: 'var(--purple)' },
 ];
 
+/* Citas reales, verificables: cada una con su fuente exacta (obra, capítulo o
+   discurso). Antes eran frases inventadas atribuidas a "AS Oracle" con
+   source:null, por eso la fuente nunca aparecía. */
 export const FRASES = [
-  { quote: 'La prisa hace ruido; el rumbo hace progreso.', author: 'AS Oracle', source: null },
-  { quote: 'Hecho es mejor que perfecto, pero no mejor que pensado.', author: 'AS Oracle', source: null },
-  { quote: 'Lo que no se mide, se inventa.', author: 'AS Oracle', source: null },
-  { quote: 'Un día ordenado vale por tres improvisados.', author: 'AS Oracle', source: null },
-  { quote: 'El dinero se va por donde nadie está mirando.', author: 'AS Oracle', source: null },
-  { quote: 'Empieza pequeño, pero empieza hoy.', author: 'AS Oracle', source: null },
-  { quote: 'La constancia le gana al talento cuando el talento no aparece.', author: 'AS Oracle', source: null },
-  { quote: 'No hay atajos hacia donde vale la pena llegar.', author: 'AS Oracle', source: null },
-  { quote: 'Tu yo de mañana agradece lo que hiciste hoy.', author: 'AS Oracle', source: null },
-  { quote: 'Cierra ciclos: lo abierto pesa más que lo difícil.', author: 'AS Oracle', source: null },
-  { quote: 'Gastar menos también es ganar más.', author: 'AS Oracle', source: null },
-  { quote: 'La claridad es una decisión, no una casualidad.', author: 'AS Oracle', source: null },
-  { quote: 'Menos ruido. Más vida.', author: 'AS Oracle', source: null },
-  { quote: 'Lo urgente grita; lo importante susurra.', author: 'AS Oracle', source: null },
+  { quote: 'No es que tengamos poco tiempo, sino que perdemos mucho.', author: 'Séneca', source: 'Sobre la brevedad de la vida (De Brevitate Vitae), cap. I' },
+  { quote: 'Muy poco es necesario para vivir feliz: todo está en tu manera de pensar.', author: 'Marco Aurelio', source: 'Meditaciones, Libro VII, 67' },
+  { quote: 'Recuerda que el tiempo es dinero.', author: 'Benjamin Franklin', source: 'Consejos a un joven comerciante, 1748' },
+  { quote: 'Estudiar sin pensar es esfuerzo perdido; pensar sin estudiar es peligroso.', author: 'Confucio', source: 'Analectas, Libro II, 15' },
+  { quote: 'El trabajo se expande hasta llenar el tiempo disponible para completarlo.', author: 'C. Northcote Parkinson', source: '"Parkinson\'s Law", The Economist, 1955' },
+  { quote: 'Un viaje de mil millas comienza con un solo paso.', author: 'Lao Tsé', source: 'Tao Te Ching, capítulo 64' },
+  { quote: 'Si uno avanza con confianza en la dirección de sus sueños y se esfuerza por vivir la vida que ha imaginado, se encontrará con un éxito inesperado.', author: 'Henry David Thoreau', source: 'Walden, "Conclusión", 1854' },
+  { quote: 'La perfección se alcanza no cuando ya no hay nada que añadir, sino cuando ya no hay nada que quitar.', author: 'Antoine de Saint-Exupéry', source: 'Tierra de hombres, 1939' },
+  { quote: 'Vuestro tiempo es limitado, así que no lo desperdiciéis viviendo la vida de otro.', author: 'Steve Jobs', source: 'Discurso de graduación en Stanford, 12 de junio de 2005' },
+  { quote: 'Todo tiene su tiempo, y todo lo que se quiere debajo del cielo tiene su hora.', author: 'Eclesiastés 3:1', source: 'Biblia' },
+  { quote: 'No es pobre el que tiene poco, sino el que codicia más.', author: 'Séneca', source: 'Cartas a Lucilio (Epistulae morales ad Lucilium), Carta II' },
 ];
