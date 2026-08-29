@@ -11,6 +11,10 @@ import { linkConSesion, perfilActivo } from '../session.js';
    Aquí solo se enlaza con la sesión puesta para que no pida PIN otra vez. */
 const READER_URL = 'https://as-reader-as24-b7b9.vercel.app/';
 
+/* Memo Recall vive en su propio sitio (mismo Supabase, mismo login PIN).
+   Aquí solo se enlaza con la sesión puesta para que no pida PIN otra vez. */
+const MEMO_URL = 'https://as-memo.vercel.app/';
+
 function fraseDelDia() {
   const iso = todayISO();
   const seed = Number(iso.replaceAll('-', '')) % FRASES.length;
@@ -81,6 +85,16 @@ function shell(nombre) {
           <h2>Reader Tracker</h2>
           <p>Cada página suma XP, logros y una season mensual entre los dos.</p>
           <div class="appStats">${raw(chip('Libros') + chip('XP') + chip('Logros'))}</div>
+          <div class="appOpen">ABRIR <b>↗</b></div>
+        </a>
+
+        <a class="appCard tilt-b" href="${linkConSesion(MEMO_URL)}" target="_blank" rel="noopener" style="--accent:var(--purple)">
+          <span class="appNum">#04</span>
+          <div class="appIcon">M</div>
+          <p class="appLabel">ESTUDIA · RECUERDA · DOMINA</p>
+          <h2>Memo Recall</h2>
+          <p>Flashcards con repetición espaciada, IA y niveles para fijar lo que estudias.</p>
+          <div class="appStats">${raw(chip('Decks') + chip('XP') + chip('Racha'))}</div>
           <div class="appOpen">ABRIR <b>↗</b></div>
         </a>
       </div>
