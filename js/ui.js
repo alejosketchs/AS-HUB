@@ -34,7 +34,8 @@ const compactFmt = new Intl.NumberFormat('es-CO', {
   notation: 'compact', maximumFractionDigits: 1,
 });
 
-export const money = (n) => moneyFmt.format(Number(n) || 0);
+// Sin espacio entre el signo y la cifra: $1.250.000
+export const money = (n) => moneyFmt.format(Number(n) || 0).replace(/\s/g, '');
 export const moneyShort = (n) => '$' + compactFmt.format(Number(n) || 0);
 export const num = (n) => new Intl.NumberFormat('es-CO').format(Number(n) || 0);
 

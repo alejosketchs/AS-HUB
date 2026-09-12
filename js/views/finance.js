@@ -1,17 +1,16 @@
-// AS HUB — AS FINANZAS (recreación del original)
-import { Finance, Checks, watch, unwatch, readCache, writeCache } from '../db.js';
+// AS HUB — AS FINANZAS (copiloto financiero)
+import { Finance, watch, unwatch, readCache, writeCache } from '../db.js';
 import {
   $, $$, html, raw, esc, money, num, toast, sheet, confirmSheet,
   todayISO, addDays, monthRange, pct,
 } from '../ui.js';
 import { TZ, ACCENTS, APP_VERSION } from '../config.js';
-import { perfilActivo } from '../session.js';
+import { perfilActivo, hashPin, cambiarPin, cerrarSesion } from '../session.js';
 import { bindCOPInput, formatCOPInput, parseCOP } from '../cop-input.js';
 
 /* ============================ constantes ============================ */
 const TABS = [
   { id: 'movimientos', label: 'Movimientos' },
-  { id: 'checklist', label: 'Check List' },
   { id: 'presupuesto', label: 'Presupuesto' },
   { id: 'ahorros', label: 'Ahorros' },
   { id: 'categorias', label: 'Categorías' },
@@ -31,11 +30,31 @@ const KINDS = {
   income: { label: 'Ingresos', emoji: '💰', line: '💰' },
 };
 
-// el original convierte el presupuesto mensual a semanal dividiendo por 4,33
-const WEEKS_PER_MONTH = 4.33;
+const TX_LABEL = {
+  income: 'Ingreso', expense: 'Gasto', saving: 'Ahorro', withdrawal: 'Retiro de ahorro',
+};
+
+/* Grupos del presupuesto semanal: cada categoría es independiente, el grupo
+   solo ordena visualmente. */
+const GROUPS = {
+  need: { label: 'Necesidades', hint: 'Mercado, gasolina, transporte' },
+  life: { label: 'Vida / disfrute', hint: 'Comidas por fuera, ocio, mecato' },
+};
+
+/* Semáforo por porcentaje utilizado. */
+const SEMAFORO = [
+  { max: 70, key: 'ok', dot: '🟢', text: 'Vas bien' },
+  { max: 90, key: 'warn', dot: '🟡', text: 'Te estás acercando al límite' },
+  { max: 100, key: 'hot', dot: '🟠', text: 'Casi agotaste el presupuesto' },
+  { max: Infinity, key: 'over', dot: '🔴', text: 'Presupuesto agotado o excedido' },
+];
+const semaforo = (p) => SEMAFORO.find((s) => p < s.max);
 
 const SLICE_COLORS = ['#e8348f', '#4a7fe0', '#a8e050', '#ffb347', '#7b5fe0',
   '#26c6a0', '#ff6b6b', '#8bd8ff', '#d5b8ff', '#b0b0a8'];
+
+/* Palabras que delatan un gasto hormiga cuando no está en la subcategoría de mecato. */
+const HORMIGA_RE = /caf[eé]|snack|antojo|mecato|golosina|dulce|helado|postre|chocolat/;
 
 /* ============================ estado ============================ */
 let root;
@@ -43,9 +62,8 @@ let state = {
   tab: 'movimientos',
   profileId: '',
   year: 0, month: 0,
-  period: 'month',
+  weekOffset: 0,
   profiles: [], cats: [], subs: [], tx: [], budgets: [], goals: [], debts: [],
-  checks: [],
   loaded: false,
 };
 
@@ -54,7 +72,10 @@ let state = {
 const H = (strings, ...values) => raw(html(strings, ...values));
 
 const n = (v) => Number(v) || 0;
+const amt = (x) => n(x.amount);
 const dateAt = (iso) => new Date(iso + 'T12:00:00');
+const dayNum = (iso) => Number(iso.slice(8, 10));
+const diffDays = (a, b) => Math.round((dateAt(b) - dateAt(a)) / 864e5);
 const norm = (s) => String(s || '').toLowerCase()
   .normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
 
@@ -70,40 +91,39 @@ function fmtLongDay(iso) {
   return `${d.getDate()} de ${MES_CORTO[d.getMonth()]}`;
 }
 
-/** Domingo de la semana que contiene la fecha dada. */
+/** Lunes de la semana que contiene la fecha dada. */
 function weekStart(iso) {
   const d = dateAt(iso);
-  return addDays(iso, -d.getDay());
+  return addDays(iso, -((d.getDay() + 6) % 7));
 }
 
-/** Cada mes tiene su propia lista; las marcas de meses anteriores quedan como historial. */
-const periodoClave = () => `${state.year}-${String(state.month).padStart(2, '0')}`;
+function weekRange(offset = 0) {
+  const start = addDays(weekStart(todayISO()), 7 * offset);
+  return { start, end: addDays(start, 6) };
+}
+
+function fmtWeek({ start, end }) {
+  const a = dateAt(start); const b = dateAt(end);
+  if (a.getMonth() === b.getMonth()) return `${a.getDate()}–${b.getDate()} ${MESES[a.getMonth()].toLowerCase()}`;
+  return `${a.getDate()} ${MES_CORTO[a.getMonth()]} – ${b.getDate()} ${MES_CORTO[b.getMonth()]}`;
+}
 
 const profile = () => state.profiles.find((p) => p.id === state.profileId) || state.profiles[0] || null;
 const catById = (id) => state.cats.find((c) => c.id === id) || null;
 const subById = (id) => state.subs.find((s) => s.id === id) || null;
+const goalById = (id) => state.goals.find((g) => g.id === id) || null;
 
 function range() {
   return monthRange(state.year, state.month);
 }
 
-function monthTx() {
-  const { from, to } = range();
+function txBetween(from, to) {
   return state.tx.filter((t) => t.transaction_date >= from && t.transaction_date <= to);
 }
 
-/** Movimientos del periodo elegido en Estadísticas. */
-function periodTx() {
-  if (state.period === 'all') return state.tx;
-  if (state.period === 'q') {
-    const { to } = range();
-    const start = monthRange(
-      state.month <= 2 ? state.year - 1 : state.year,
-      ((state.month - 3 + 12 - 1) % 12) + 1,
-    ).from;
-    return state.tx.filter((t) => t.transaction_date >= start && t.transaction_date <= to);
-  }
-  return monthTx();
+function monthTx() {
+  const { from, to } = range();
+  return txBetween(from, to);
 }
 
 const sumBy = (list, f) => list.reduce((acc, x) => acc + n(f(x)), 0);
@@ -119,23 +139,219 @@ function descHistory() {
   return [...seen.entries()].sort((a, b) => b[1] - a[1]).map(([d]) => d).slice(0, 40);
 }
 
+/** Quiénes han reembolsado antes, para autocompletar. */
+function payerHistory() {
+  return [...new Set(state.tx.map((t) => (t.reimburse_by || '').trim()).filter(Boolean))];
+}
+
+/* ============================ motor de cálculo ============================
+   Conceptos que nunca se mezclan:
+   - gasto real: reduce el patrimonio (excluye reembolsables)
+   - ahorro: sigue siendo mío, solo cambia de lugar (no es gasto)
+   - reembolsable: salió de la cuenta pero vuelve (cuenta en saldo, no en presupuesto)
+   - saldo: dinero en la cuenta ahora mismo
+   - dinero libre: saldo menos obligaciones, presupuesto protegido y deudas       */
+const isIncome = (t) => t.type === 'income';
+const isExpense = (t) => t.type === 'expense';
+const isSaving = (t) => t.type === 'saving';
+const isWithdrawal = (t) => t.type === 'withdrawal';
+const isReimbursable = (t) => isExpense(t) && !!t.reimbursable;
+const refundCatId = () => state.cats.find((c) => c.slug === 'refund')?.id || null;
+const isRefund = (t) => isIncome(t) && !!refundCatId() && t.category_id === refundCatId();
+const isRealExpense = (t) => isExpense(t) && !t.reimbursable;
+const isRealIncome = (t) => isIncome(t) && !isRefund(t);
+const isFixedTx = (t) => isRealExpense(t) && t.spend_type === 'fixed';
+const isVarTx = (t) => isRealExpense(t) && t.spend_type !== 'fixed';
+
 function totals(list) {
-  const income = sumBy(list.filter((t) => t.type === 'income'), (t) => t.amount);
-  const expense = sumBy(list.filter((t) => t.type === 'expense'), (t) => t.amount);
-  return { income, expense, balance: income - expense };
+  return {
+    income: sumBy(list.filter(isRealIncome), amt),
+    expense: sumBy(list.filter(isRealExpense), amt),
+    fixed: sumBy(list.filter(isFixedTx), amt),
+    variable: sumBy(list.filter(isVarTx), amt),
+    saving: sumBy(list.filter(isSaving), amt) - sumBy(list.filter(isWithdrawal), amt),
+    cashIn: sumBy(list.filter((t) => isIncome(t) || isWithdrawal(t)), amt),
+    cashOut: sumBy(list.filter((t) => isExpense(t) || isSaving(t)), amt),
+  };
+}
+
+/** Saldo disponible: saldo inicial más todo lo que entró menos todo lo que salió. */
+function saldo() {
+  const t = totals(state.tx);
+  return n(profile()?.opening_balance) + t.cashIn - t.cashOut;
+}
+
+const activeBudgets = () => state.budgets.filter((b) => b.active !== false);
+const fixedLines = () => activeBudgets().filter((b) => b.kind === 'fixed' && b.period !== 'week');
+const savingLines = () => activeBudgets().filter((b) => b.kind === 'saving' && b.period !== 'week');
+const weeklyLines = () => activeBudgets().filter((b) => b.period === 'week');
+const weeklyTotal = () => sumBy(weeklyLines(), amt);
+
+/** Un gasto fijo se da por pagado cuando hay un movimiento del mes con su
+ *  subcategoría o con su nombre en la descripción. */
+function fixedStatus(list) {
+  return fixedLines().map((b) => {
+    const key = norm(b.name);
+    const hits = list.filter((t) => isExpense(t) && (
+      (b.subcategory_id && t.subcategory_id === b.subcategory_id)
+      || (key && norm(t.description).includes(key))));
+    const paid = sumBy(hits, amt);
+    return { b, hits, paid, done: hits.length > 0, pending: hits.length ? 0 : n(b.amount) };
+  });
+}
+
+/** Línea semanal a la que pertenece un gasto: primero por subcategoría, luego por categoría. */
+function weekLineFor(t) {
+  const lines = weeklyLines();
+  return lines.find((b) => b.subcategory_id && b.subcategory_id === t.subcategory_id)
+    || lines.find((b) => !b.subcategory_id && b.category_id === t.category_id)
+    || null;
+}
+
+function weekReport(offset = 0) {
+  const { start, end } = weekRange(offset);
+  // Solo gasto variable real: los fijos tienen su propio plan y los reembolsables vuelven.
+  const week = txBetween(start, end).filter(isVarTx);
+  const items = weeklyLines().map((b) => {
+    const spent = sumBy(week.filter((t) => weekLineFor(t)?.id === b.id), amt);
+    const budget = n(b.amount);
+    const used = budget ? Math.round((spent / budget) * 100) : (spent ? 100 : 0);
+    return { b, spent, budget, left: budget - spent, used, sem: semaforo(used) };
+  });
+  const other = sumBy(week.filter((t) => !weekLineFor(t)), amt);
+  const groups = Object.keys(GROUPS).map((key) => {
+    const its = items.filter((i) => (i.b.group_key || 'life') === key);
+    return { key, ...GROUPS[key], items: its, budget: sumBy(its, (i) => i.budget), spent: sumBy(its, (i) => i.spent), left: sumBy(its, (i) => Math.max(0, i.left)) };
+  });
+  return {
+    start, end, items, groups, other,
+    budget: weeklyTotal(),
+    spent: sumBy(items, (i) => i.spent),
+    left: sumBy(items, (i) => Math.max(0, i.left)),
+  };
+}
+
+/** Reembolsables que aún no han vuelto a la cuenta. */
+function reimbPending() {
+  const items = state.tx.filter((t) => isReimbursable(t) && !t.reimbursed_at);
+  const by = new Map();
+  items.forEach((t) => {
+    const k = (t.reimburse_by || '').trim() || 'Sin indicar';
+    by.set(k, (by.get(k) || 0) + amt(t));
+  });
+  return { items, total: sumBy(items, amt), by: [...by.entries()].sort((a, b) => b[1] - a[1]) };
+}
+
+/** Todo lo que se puede saber del mes: totales, ritmo, proyección. */
+function monthEngine(year = state.year, month = state.month) {
+  const { from, to } = monthRange(year, month);
+  const list = txBetween(from, to);
+  const t = totals(list);
+  const today = todayISO();
+  const daysInMonth = dayNum(to);
+  let elapsed = 0;
+  if (today > to) elapsed = daysInMonth;
+  else if (today >= from) elapsed = dayNum(today);
+  const elapsedPct = Math.round((elapsed / daysInMonth) * 100);
+
+  const varBudget = Math.round(weeklyTotal() * (daysInMonth / 7));
+  const fixed = fixedStatus(list);
+  const fixedPlanned = sumBy(fixedLines(), amt);
+  const fixedPaid = sumBy(fixed, (f) => f.paid);
+  const fixedPending = sumBy(fixed, (f) => f.pending);
+  const savingPlanned = sumBy(savingLines(), amt);
+
+  const usedPct = varBudget ? Math.round((t.variable / varBudget) * 100) : 0;
+  const dailyAvg = elapsed ? t.variable / elapsed : 0;
+  const weeklyAvg = dailyAvg * 7;
+
+  let pace;
+  if (!elapsed) pace = { key: 'idle', dot: '⏳', text: 'El mes aún no empieza' };
+  else if (!varBudget) pace = { key: 'idle', dot: '⚙️', text: 'Configura tu presupuesto semanal' };
+  else if (usedPct >= 100) pace = { key: 'fast', dot: '🔴', text: 'Presupuesto variable agotado' };
+  else if (usedPct > elapsedPct + 5) pace = { key: 'fast', dot: '🔴', text: 'Estás gastando más rápido de lo previsto' };
+  else pace = { key: 'ok', dot: '🟢', text: 'Vas bien este mes' };
+
+  const projVar = elapsed ? Math.round(dailyAvg * daysInMonth) : varBudget;
+  const projExpense = fixedPaid + fixedPending + projVar;
+  const projSaving = Math.max(t.saving, savingPlanned);
+  const expectedIncome = Math.max(t.income, n(profile()?.base_income));
+  const projFree = expectedIncome - projExpense - projSaving;
+  const savingRate = t.income ? Math.round((t.saving / t.income) * 100) : 0;
+
+  return {
+    from, to, list, t, daysInMonth, elapsed, elapsedPct,
+    varBudget, fixed, fixedPlanned, fixedPaid, fixedPending, savingPlanned,
+    usedPct, dailyAvg, weeklyAvg, pace,
+    projVar, projExpense, projSaving, expectedIncome, projFree, savingRate,
+  };
+}
+
+/** Dinero realmente libre, siempre calculado a hoy. */
+function freeMoney() {
+  const today = todayISO();
+  const y = Number(today.slice(0, 4)); const m = Number(today.slice(5, 7));
+  const eng = monthEngine(y, m);
+  const wk = weekReport(0);
+  const { to } = monthRange(y, m);
+  // Semanas que faltan después de esta, dentro del mes.
+  const daysAfter = Math.max(0, diffDays(wk.end, to));
+  const protectedBudget = Math.round(wk.left + weeklyTotal() * (daysAfter / 7));
+  const debts = sumBy(state.debts.filter((d) => d.status !== 'paid'), amt);
+  const reimb = reimbPending().total;
+  const s = saldo();
+  return {
+    saldo: s,
+    fixedPending: eng.fixedPending,
+    protectedBudget,
+    debts,
+    reimb,
+    free: s - eng.fixedPending - protectedBudget - debts + reimb,
+    week: wk,
+    eng,
+  };
+}
+
+function breakdown(list, keyOf) {
+  const map = new Map();
+  list.forEach((t) => {
+    const { key, name, emoji } = keyOf(t);
+    const prev = map.get(key) || { key, name, emoji, value: 0, count: 0 };
+    prev.value += amt(t);
+    prev.count += 1;
+    map.set(key, prev);
+  });
+  return [...map.values()].sort((a, b) => b.value - a.value);
+}
+
+const byCat = (t) => {
+  const c = catById(t.category_id);
+  return { key: c?.id || 'sin', name: c?.name || 'Sin categoría', emoji: c?.emoji || '📦' };
+};
+const bySub = (t) => {
+  const c = catById(t.category_id); const s = subById(t.subcategory_id);
+  return {
+    key: s?.id || ('cat:' + (c?.id || 'sin')),
+    name: s ? `${s.name} · ${c?.name || ''}` : (c?.name || 'Sin categoría'),
+    emoji: s?.emoji || c?.emoji || '📦',
+  };
+};
+
+function hormigaTx(list) {
+  const mecatoIds = state.subs.filter((s) => norm(s.name).includes('mecato')).map((s) => s.id);
+  return list.filter((t) => isRealExpense(t)
+    && (mecatoIds.includes(t.subcategory_id) || HORMIGA_RE.test(norm(t.description))));
 }
 
 /* ============================ carga ============================ */
 async function loadAll({ silent = false } = {}) {
   const pid = state.profileId;
-  const mes = `${state.year}-${String(state.month).padStart(2, '0')}`;
-  const [profiles, cats, subs, tx, budgets, goals, debts, checks] = await Promise.all([
+  const [profiles, cats, subs, tx, budgets, goals, debts] = await Promise.all([
     Finance.profiles(), Finance.categories(), Finance.subcategories(),
     Finance.allTransactions(pid), Finance.budgets(pid), Finance.goals(pid), Finance.debts(pid),
-    Checks.list(pid, mes),
   ]);
-  Object.assign(state, { profiles, cats, subs, tx, budgets, goals, debts, checks, loaded: true });
-  writeCache('fin:' + pid, { profiles, cats, subs, tx, budgets, goals, debts, checks });
+  Object.assign(state, { profiles, cats, subs, tx, budgets, goals, debts, loaded: true });
+  writeCache('fin:' + pid, { profiles, cats, subs, tx, budgets, goals, debts });
   aplicarAcento(profiles.find((x) => x.id === pid));
   if (!silent) toast('Finanzas al día');
   paint();
@@ -146,34 +362,68 @@ function hydrate() {
   if (c) Object.assign(state, c, { loaded: true });
 }
 
-/* ============================ piezas ============================ */
+/* ============================ cabecera ============================ */
 function statsHTML() {
-  const p = profile();
-  const t = totals(monthTx());
+  const fm = freeMoney();
+  const eng = monthEngine();
+  const re = reimbPending();
   return html`
-    <div class="finStats">
-      <div class="finStat">
-        <span>Ingreso base <button type="button" data-act="base" aria-label="Editar ingreso base">✎</button></span>
-        <b>${money(p?.base_income)}</b>
+    <div class="finPace finPace--${eng.pace.key}">${eng.pace.dot} ${eng.pace.text}</div>
+    <div class="finStats finStats--home">
+      <div class="finStat finStat--bal">
+        <span>Saldo disponible <button type="button" data-act="opening" aria-label="Ajustar saldo inicial">✎</button></span>
+        <b>${money(fm.saldo)}</b>
       </div>
-      <div class="finStat finStat--in"><span>Ingresos registrados</span><b>${money(t.income)}</b></div>
-      <div class="finStat finStat--out"><span>Gastos registrados</span><b>${money(t.expense)}</b></div>
-      <div class="finStat finStat--bal"><span>Balance actual</span><b>${money(t.balance)}</b></div>
+      <button class="finStat finStat--free" type="button" data-act="free-detail">
+        <span>Dinero realmente libre <i>ver cálculo</i></span>
+        <b>${money(fm.free)}</b>
+      </button>
+      <div class="finStat finStat--week">
+        <span>Te queda esta semana</span>
+        <b>${money(fm.week.left)}</b>
+        <small>de ${money(fm.week.budget)} · ${fmtWeek(fm.week)}</small>
+      </div>
+      <div class="finStat finStat--sav">
+        <span>Ahorro del mes</span>
+        <b>${money(eng.t.saving)}</b>
+        <small>${eng.savingRate}% de tus ingresos</small>
+      </div>
+      <button class="finStat finStat--re" type="button" data-act="reconcile">
+        <span>Reembolsos pendientes <i>${re.items.length ? 'conciliar' : ''}</i></span>
+        <b>${money(re.total)}</b>
+        ${re.by.length ? H`<small>${re.by.map(([k, v]) => `${k}: ${money(v)}`).join(' · ')}</small>` : ''}
+      </button>
     </div>`;
 }
 
+/* ============================ vista: MOVIMIENTOS ============================ */
 function rowHTML(t) {
   const cat = catById(t.category_id);
   const sub = subById(t.subcategory_id);
-  const income = t.type === 'income';
-  const title = t.description || sub?.name || cat?.name || 'Movimiento';
+  const goal = goalById(t.goal_id);
+  const title = t.description || sub?.name || cat?.name || goal?.name || TX_LABEL[t.type] || 'Movimiento';
+  let cls = 'finRow--out'; let sign = '− '; let icon = sub?.emoji || cat?.emoji || '💸';
+  if (isIncome(t)) { cls = 'finRow--in'; sign = '+ '; }
+  if (isSaving(t)) { cls = 'finRow--sav'; sign = '→ '; icon = '🐖'; }
+  if (isWithdrawal(t)) { cls = 'finRow--wd'; sign = '← '; icon = '🐖'; }
   // Sin hora conocida (movimientos históricos importados) no se muestra nada.
-  const meta = [cat?.name, sub?.name, timeOf(t.occurred_at)].filter(Boolean).join(' · ');
+  const meta = [
+    goal ? `Meta: ${goal.name}` : null,
+    cat?.name, sub?.name, timeOf(t.occurred_at),
+  ].filter(Boolean).join(' · ');
+  let chip = '';
+  if (isReimbursable(t)) {
+    chip = t.reimbursed_at
+      ? H`<em class="finChip finChip--ok">✓ Reembolsado${t.reimburse_by ? ' · ' + t.reimburse_by : ''}</em>`
+      : H`<em class="finChip finChip--re">↩ Reembolsable${t.reimburse_by ? ' · ' + t.reimburse_by : ''}</em>`;
+  } else if (isRefund(t)) {
+    chip = H`<em class="finChip finChip--ok">↩ Reembolso recibido</em>`;
+  }
   return html`
-    <div class="finRow ${income ? 'finRow--in' : 'finRow--out'}" data-tx="${t.id}">
-      <div class="finRowIcon">${sub?.emoji || cat?.emoji || '💸'}</div>
-      <div class="finRowText"><b>${title}</b><small>${meta}</small></div>
-      <div class="finRowAmt">${income ? '+ ' : '− '}${money(t.amount)}</div>
+    <div class="finRow ${cls}" data-tx="${t.id}">
+      <div class="finRowIcon">${icon}</div>
+      <div class="finRowText"><b>${title}</b><small>${meta}</small>${chip}</div>
+      <div class="finRowAmt">${sign}${money(t.amount)}</div>
       <div class="finIcons">
         <button type="button" data-act="tx-edit" aria-label="Editar">✎</button>
         <button type="button" data-act="tx-del" aria-label="Eliminar">✕</button>
@@ -183,12 +433,10 @@ function rowHTML(t) {
 
 function viewMovimientos() {
   const list = monthTx();
-  const expenses = list.filter((t) => t.type === 'expense');
-  const fijos = sumBy(expenses.filter((t) => t.spend_type === 'fixed'), (t) => t.amount);
-  const variables = sumBy(expenses.filter((t) => t.spend_type !== 'fixed'), (t) => t.amount);
-  const hoy = sumBy(expenses.filter((t) => t.transaction_date === todayISO()), (t) => t.amount);
-
-  const days = [...new Set(list.map((t) => t.transaction_date))].sort().reverse();
+  const t = totals(list);
+  const hoy = sumBy(list.filter((x) => isRealExpense(x) && x.transaction_date === todayISO()), amt);
+  const re = reimbPending();
+  const days = [...new Set(list.map((x) => x.transaction_date))].sort().reverse();
 
   return html`
     <div class="finPanel">
@@ -199,15 +447,18 @@ function viewMovimientos() {
         </div>
       </div>
 
-      <div class="finMini">
-        <div class="finMiniBox"><span>FIJOS</span><b>${money(fijos)}</b></div>
-        <div class="finMiniBox"><span>VARIABLES</span><b>${money(variables)}</b></div>
+      <div class="finMini finMini--4">
+        <div class="finMiniBox"><span>FIJOS</span><b>${money(t.fixed)}</b></div>
+        <div class="finMiniBox"><span>VARIABLES</span><b>${money(t.variable)}</b></div>
         <div class="finMiniBox"><span>HOY</span><b>${money(hoy)}</b></div>
+        <button class="finMiniBox finMiniBox--btn" type="button" data-act="reconcile">
+          <span>POR REEMBOLSAR</span><b>${money(re.total)}</b>
+        </button>
       </div>
 
       ${days.length ? raw(`<div class="finDays">${days.map((iso) => {
-    const items = list.filter((t) => t.transaction_date === iso);
-    const t = totals(items);
+    const items = list.filter((x) => x.transaction_date === iso);
+    const dt = totals(items);
     const d = dateAt(iso);
     return html`
           <section class="finDay">
@@ -217,8 +468,8 @@ function viewMovimientos() {
                 <span>${DIAS_CORTOS[d.getDay()]}<i>${MES_CORTO[d.getMonth()]} de ${d.getFullYear()}</i></span>
               </div>
               <div class="finDaySum">
-                <span class="in">${t.income ? '+ ' + money(t.income) : money(0)}</span>
-                <span class="out">${t.expense ? '− ' + money(t.expense) : money(0)}</span>
+                <span class="in">${dt.cashIn ? '+ ' + money(dt.cashIn) : money(0)}</span>
+                <span class="out">${dt.cashOut ? '− ' + money(dt.cashOut) : money(0)}</span>
               </div>
             </div>
             ${raw(items.map(rowHTML).join(''))}
@@ -227,120 +478,164 @@ function viewMovimientos() {
     </div>`;
 }
 
-function budgetTotals() {
-  const by = (k) => sumBy(state.budgets.filter((b) => b.kind === k && b.active !== false), (b) => b.amount);
-  const fixed = by('fixed');
-  const variable = by('variable');
-  const saving = by('saving');
-  const debt = sumBy(state.debts.filter((d) => d.status !== 'paid'), (d) => d.amount);
-  return { fixed, variable, saving, debt, total: fixed + variable + saving };
-}
-
-function weekRhythm() {
-  const start = weekStart(todayISO());
-  const end = addDays(start, 6);
-  const week = state.tx.filter((t) => t.type === 'expense'
-    && t.transaction_date >= start && t.transaction_date <= end);
-
-  const items = state.budgets.filter((b) => b.is_weekly && b.active !== false).map((b) => {
-    const spent = sumBy(week.filter((t) => t.category_id === b.category_id), (t) => t.amount);
-    const weekly = Math.round(n(b.amount) / WEEKS_PER_MONTH);
-    return { name: b.name, spent, weekly, over: spent > weekly };
-  });
-  return { start, end, items };
-}
-
-function spendTypeFor(type, categoryId) {
-  if (type === 'income') return 'income';
-  const b = state.budgets.find((x) => x.category_id === categoryId
-    && x.active !== false && (x.kind === 'fixed' || x.kind === 'variable'));
-  return b ? b.kind : 'variable';
+/* ============================ vista: PRESUPUESTO ============================ */
+function weekItemHTML(it) {
+  return html`
+    <div class="finWeekItem is-${it.sem.key}" data-budget="${it.b.id}">
+      <b>${it.b.name}<i>${money(it.spent)} / ${money(it.budget)}</i></b>
+      <div class="finBar"><i style="width:${Math.min(100, it.used)}%"></i></div>
+      <div class="finWeekFoot">
+        <span>${it.sem.dot} ${num(it.used)}% utilizado</span>
+        ${it.left >= 0
+    ? H`<span class="left">Te quedan ${money(it.left)}</span>`
+    : H`<span class="over">Excedido ${money(-it.left)}</span>`}
+      </div>
+      <div class="finWeekState">
+        <small>${it.sem.text}</small>
+        <span class="finIcons">
+          <button type="button" data-act="wk-edit" aria-label="Editar">✎</button>
+          <button type="button" data-act="bud-del" aria-label="Eliminar">✕</button>
+        </span>
+      </div>
+    </div>`;
 }
 
 function viewPresupuesto() {
   const p = profile();
-  const b = budgetTotals();
-  const free = n(p?.base_income) - b.total;
-  const rhythm = weekRhythm();
-  const pendientes = state.debts.filter((d) => d.status !== 'paid');
+  const eng = monthEngine();
+  const fm = freeMoney();
+  const wk = weekReport(state.weekOffset);
+  const weeksLabel = (eng.daysInMonth / 7).toFixed(1).replace('.', ',');
 
-  const lines = (kind) => state.budgets.filter((x) => x.kind === kind && x.active !== false);
-  const lineGroup = (kind) => (lines(kind).length ? html`
-      <p class="finGroupTitle">${KINDS[kind].label}</p>
-      ${raw(lines(kind).map((x) => html`
-        <div class="finLine" data-budget="${x.id}">
-          <span>${KINDS[kind].line} ${x.name}</span>
-          <b>${money(x.amount)}</b>
-          <span class="finIcons" style="flex:none">
-            <button type="button" data-act="bud-edit" aria-label="Editar">✎</button>
-            <button type="button" data-act="bud-del" aria-label="Eliminar">✕</button>
-          </span>
-        </div>`).join(''))}` : '');
+  const fixedRows = eng.fixed.map(({ b, done, paid }) => html`
+    <div class="finLine ${done ? 'is-done' : ''}" data-budget="${b.id}">
+      <span><i class="finDot">${done ? '✓' : '○'}</i> ${b.name}${done && paid !== n(b.amount) ? H`<small> pagado ${money(paid)}</small>` : ''}</span>
+      <b>${money(b.amount)}</b>
+      <span class="finIcons" style="flex:none">
+        <button type="button" data-act="bud-edit" aria-label="Editar">✎</button>
+        <button type="button" data-act="bud-del" aria-label="Eliminar">✕</button>
+      </span>
+    </div>`).join('');
+
+  const savingRows = savingLines().map((b) => html`
+    <div class="finLine" data-budget="${b.id}">
+      <span>🐖 ${b.name}</span>
+      <b>${money(b.amount)}</b>
+      <span class="finIcons" style="flex:none">
+        <button type="button" data-act="bud-edit" aria-label="Editar">✎</button>
+        <button type="button" data-act="bud-del" aria-label="Eliminar">✕</button>
+      </span>
+    </div>`).join('');
+
+  const groupHTML = (g) => html`
+    <section class="finGroup finGroup--${g.key}">
+      <div class="finGroupHead">
+        <div><b>${g.label}</b><small>${g.hint}</small></div>
+        <i>${money(g.spent)} / ${money(g.budget)}</i>
+      </div>
+      ${g.items.length
+    ? raw(g.items.map(weekItemHTML).join(''))
+    : H`<div class="finEmpty" style="padding:14px">Sin categorías en este grupo.</div>`}
+    </section>`;
 
   return html`
     <div class="finTwo">
       <div class="finPanel">
         <div class="finPanelHead">
-          <div><span class="finTag">Plan del mes</span><h2>Presupuesto dividido</h2></div>
-          <button class="finBtn" type="button" data-act="bud-new">+ Obligación</button>
+          <div>
+            <span class="finTag finTag--lime">Ritmo semanal</span>
+            <h2>Esta semana</h2>
+          </div>
+          <div class="finWeekNav">
+            <button class="finArrow" type="button" data-act="wk-prev" aria-label="Semana anterior">‹</button>
+            <span>${state.weekOffset === 0 ? 'Semana actual' : state.weekOffset === -1 ? 'Semana pasada' : state.weekOffset === 1 ? 'Próxima semana' : 'Semana'} · ${fmtWeek(wk)}</span>
+            <button class="finArrow" type="button" data-act="wk-next" aria-label="Semana siguiente">›</button>
+          </div>
         </div>
 
-        <div class="finBudgetGrid">
-          <div class="finBox finBox--fix"><span>📌 Mínimo necesario</span><b>${money(b.fixed)}</b><small>Suma de todos tus gastos fijos</small></div>
-          <div class="finBox finBox--var"><span>🎲 Mínimo variable</span><b>${money(b.variable)}</b><small>Suma de tus variables presupuestados</small></div>
-          <div class="finBox finBox--sav"><span>🐖 Ahorro planeado</span><b>${money(b.saving)}</b><small>Apartado obligatorio del mes</small></div>
-          <div class="finBox finBox--debt"><span>💳 Deudas pendientes</span><b>${money(b.debt)}</b><small>Obligaciones por organizar; no son gastos realizados</small></div>
-          <div class="finBox finBox--total"><span>Total comprometido</span><b>${money(b.total)}</b><small>Libre después del plan: ${money(free)}</small></div>
+        <div class="finWeekHero ${wk.left <= 0 && wk.budget ? 'is-over' : ''}">
+          <span>${wk.left > 0 ? 'Te quedan' : 'Ya no te queda'}</span>
+          <b>${money(Math.max(0, wk.left))}</b>
+          <small>para gastar esta semana · gastado ${money(wk.spent)} de ${money(wk.budget)}</small>
         </div>
 
-        <details class="finDetails">
-          <summary>▸ Ver ${num(pendientes.length)} ${pendientes.length === 1 ? 'deuda pendiente' : 'deudas pendientes'}</summary>
-          <div>${pendientes.length ? raw(pendientes.map((d) => html`
-            <div class="finLine"><span>💳 ${d.person}${d.concept ? ' · ' + d.concept : ''}</span><b>${money(d.amount)}</b></div>`).join(''))
-    : H`<p class="finEmpty" style="padding:16px">Sin deudas pendientes.</p>`}</div>
-        </details>
+        ${wk.items.length
+    ? raw(wk.groups.map(groupHTML).join(''))
+    : H`<div class="finEmpty">Agrega categorías semanales para ver cuánto te queda.</div>`}
 
-        <div class="finLines">
-          ${raw(lineGroup('fixed'))}${raw(lineGroup('variable'))}${raw(lineGroup('saving'))}
-          ${state.budgets.length ? '' : H`<div class="finEmpty">Aún no hay obligaciones en el plan.</div>`}
+        ${wk.other ? H`<p class="finNote">Fuera del presupuesto semanal: <b>${money(wk.other)}</b> (personal, imprevistos, varios).</p>` : ''}
+
+        <div class="finPanelFoot">
+          <button class="finBtn finBtn--sm" type="button" data-act="wk-new">+ Categoría semanal</button>
         </div>
       </div>
 
       <div class="finPanel">
         <div class="finPanelHead">
-          <div>
-            <span class="finTag finTag--lime">Ritmo semanal</span>
-            <h2>Presupuesto semanal</h2>
-            <p>Semana actual · ${fmtLongDay(rhythm.start)} — ${fmtLongDay(rhythm.end)}</p>
-          </div>
-          <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act="week-pick">Elegir categorías</button>
+          <div><span class="finTag">Plan del mes</span><h2>Presupuesto mensual</h2><p>${MESES[state.month - 1]} de ${state.year}</p></div>
         </div>
-        ${rhythm.items.length ? raw(`<div class="finWeek">${rhythm.items.map((it) => {
-    const p2 = it.weekly ? Math.round((it.spent / it.weekly) * 100) : 0;
-    return html`
-            <div class="finWeekItem">
-              <b>${it.name}<i style="color:${it.over ? 'var(--fn-red)' : 'inherit'}">${money(it.spent)} / ${money(it.weekly)}</i></b>
-              <small>Coincidencia por nombre</small>
-              <div class="finBar ${it.over ? 'is-over' : ''}"><i style="width:${Math.min(100, p2)}%"></i></div>
-              <div class="finWeekFoot">
-                <span>${num(p2)}% gastado</span>
-                ${it.over
-    ? H`<span class="over">Excedido ${money(it.spent - it.weekly)}</span>`
-    : H`<span>Quedan ${money(it.weekly - it.spent)}</span>`}
-              </div>
-            </div>`;
-  }).join('')}</div>`) : H`<div class="finEmpty">Agrega obligaciones variables para ver tu ritmo semanal.</div>`}
+
+        <div class="finBudgetGrid">
+          <div class="finBox finBox--in">
+            <span>💰 Ingreso esperado <button type="button" data-act="base" aria-label="Editar ingreso base">✎</button></span>
+            <b>${money(p?.base_income)}</b>
+            <small>Registrado este mes: ${money(eng.t.income)}</small>
+          </div>
+          <div class="finBox finBox--fix">
+            <span>📌 Gastos fijos</span>
+            <b>${money(eng.fixedPlanned)}</b>
+            <small>Pagado ${money(eng.fixedPaid)} · pendiente ${money(eng.fixedPending)}</small>
+          </div>
+          <div class="finBox finBox--var">
+            <span>🎲 Variables del mes</span>
+            <b>${money(eng.varBudget)}</b>
+            <small>${money(weeklyTotal())} por semana × ${weeksLabel} · usado ${money(eng.t.variable)}</small>
+          </div>
+          <div class="finBox finBox--sav">
+            <span>🐖 Ahorro planeado</span>
+            <b>${money(eng.savingPlanned)}</b>
+            <small>Ahorrado este mes: ${money(eng.t.saving)}</small>
+          </div>
+          <button class="finBox finBox--total" type="button" data-act="free-detail">
+            <span>✦ Dinero realmente libre</span>
+            <b>${money(fm.free)}</b>
+            <small>Saldo ${money(fm.saldo)} − fijos pendientes − presupuesto protegido − deudas + reembolsos · toca para ver el cálculo</small>
+          </button>
+        </div>
+
+        <div class="finLines">
+          <p class="finGroupTitle">📌 Gastos fijos del mes · ${money(eng.fixedPlanned)}</p>
+          ${raw(fixedRows)}
+          ${eng.fixed.length ? '' : H`<div class="finEmpty" style="padding:14px">Sin gastos fijos configurados.</div>`}
+          <div class="finPanelFoot"><button class="finBtn finBtn--sm finBtn--plain" type="button" data-act="bud-new" data-kind="fixed">+ Gasto fijo</button></div>
+
+          <p class="finGroupTitle">🐖 Ahorro planeado · ${money(eng.savingPlanned)}</p>
+          ${raw(savingRows)}
+          ${savingLines().length ? '' : H`<div class="finEmpty" style="padding:14px">Sin ahorro planeado.</div>`}
+          <div class="finPanelFoot"><button class="finBtn finBtn--sm finBtn--plain" type="button" data-act="bud-new" data-kind="saving">+ Ahorro planeado</button></div>
+        </div>
       </div>
     </div>`;
 }
 
+/* ============================ vista: AHORROS ============================ */
 function viewAhorros() {
+  const eng = monthEngine();
+  const totalSaved = sumBy(state.goals, (g) => g.current);
+  const totalTarget = sumBy(state.goals, (g) => g.target);
   return html`
     <div class="finPanel">
       <div class="finPanelHead">
         <div><span class="finTag">Paso a paso</span><h2>Metas de ahorro</h2></div>
         <button class="finBtn" type="button" data-act="goal-new">+ Nueva meta</button>
       </div>
+
+      <div class="finMini">
+        <div class="finMiniBox"><span>AHORRADO TOTAL</span><b>${money(totalSaved)}</b></div>
+        <div class="finMiniBox"><span>META TOTAL</span><b>${money(totalTarget)}</b></div>
+        <div class="finMiniBox"><span>ESTE MES</span><b>${money(eng.t.saving)}</b></div>
+      </div>
+
       ${state.goals.length ? raw(`<div class="finGoals">${state.goals.map((g) => {
     const p2 = pct(n(g.current), n(g.target));
     return html`
@@ -353,18 +648,22 @@ function viewAhorros() {
           <div class="finGoalBody">
             <div class="finGoalTop"><b>🎯 ${g.name}</b><i>${num(p2)}%</i></div>
             <div class="finBar"><i style="width:${p2}%"></i></div>
-            <p class="finGoalNums">${money(g.current)} de ${money(g.target)}</p>
-            ${g.target_date ? H`<p class="finGoalDate">Fecha objetivo: ${g.target_date}</p>` : ''}
+            <p class="finGoalNums">${money(g.current)} / ${money(g.target)}</p>
+            <p class="finGoalDate">${g.target_date ? 'Fecha objetivo: ' + g.target_date + ' · ' : ''}Faltan ${money(Math.max(0, n(g.target) - n(g.current)))}</p>
             <div class="finGoalActions">
+              <button class="finBtn finBtn--sm" type="button" data-act="goal-in">+ Ingresar ahorro</button>
+              <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act="goal-out">Retirar</button>
               <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act="goal-edit">Editar</button>
               <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act="goal-del">Eliminar</button>
             </div>
           </div>
         </article>`;
   }).join('')}</div>`) : H`<div class="finEmpty">Todavía no tienes metas. Crea la primera con “+ Nueva meta”.</div>`}
+      <p class="finNote">Ahorrar no es gastar: cada ingreso a una meta crea un movimiento de tipo <b>Ahorro</b> que baja del saldo disponible sin sumar a tus gastos.</p>
     </div>`;
 }
 
+/* ============================ vista: CATEGORÍAS ============================ */
 function viewCategorias() {
   const section = (title, emoji, cats, kindForNew) => {
     return html`
@@ -406,39 +705,61 @@ function viewCategorias() {
     </div>`;
 }
 
+/* ============================ vista: DEUDAS ============================ */
+function debtHTML(d) {
+  const paid = d.status === 'paid';
+  return html`
+    <article class="finDebt ${paid ? 'is-paid' : ''}" data-debt="${d.id}">
+      <div class="finDebtTop">
+        <span class="finDebtState">${paid ? '✓ PAGADA' : '⏳ PENDIENTE'}</span>
+        <span class="finDebtAmt">${money(d.amount)}</span>
+      </div>
+      <b>${d.person}</b>
+      <p>${d.concept || 'Sin concepto'}</p>
+      <small>Creada ${d.created_date || '—'}${paid && d.paid_at ? ' · pagada ' + d.paid_at.slice(0, 10) : ''}</small>
+      ${!paid && d.due_date ? H`<p class="finDebtNext">📅 Próximo pago: <b>${d.due_date}</b>${d.due_date < todayISO() ? ' · vencida' : ''}</p>` : ''}
+      <div class="finDebtActions">
+        <button class="finBtn finBtn--sm ${paid ? 'finBtn--plain' : ''}" type="button" data-act="debt-toggle">${paid ? 'Marcar pendiente' : '✓ Marcar como pagada'}</button>
+        <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act="debt-edit">Editar</button>
+        <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act="debt-del">Eliminar</button>
+      </div>
+    </article>`;
+}
+
 function viewDeudas() {
-  const pendientes = state.debts.filter((d) => d.status !== 'paid');
-  const total = sumBy(pendientes, (d) => d.amount);
+  const pendientes = state.debts.filter((d) => d.status !== 'paid')
+    .sort((a, b) => String(a.due_date || '9999').localeCompare(String(b.due_date || '9999')));
+  const pagadas = state.debts.filter((d) => d.status === 'paid')
+    .sort((a, b) => String(b.paid_at || '').localeCompare(String(a.paid_at || '')));
+  const total = sumBy(pendientes, amt);
+  const historico = sumBy(pagadas, amt);
+  const next = pendientes.find((d) => d.due_date);
   return html`
     <div class="finPanel">
       <div class="finPanelHead">
-        <div><span class="finTag finTag--lime">Obligaciones pendientes</span><h2>Deudas</h2></div>
+        <div><span class="finTag finTag--lime">Obligaciones</span><h2>Deudas</h2></div>
         <button class="finBtn" type="button" data-act="debt-new">+ Nueva deuda</button>
       </div>
 
-      <div class="finDebtTotal"><span>Pendiente por pagar</span><b>${money(total)}</b></div>
+      <div class="finMini">
+        <div class="finMiniBox finMiniBox--pink"><span>DEUDA PENDIENTE TOTAL</span><b>${money(total)}</b></div>
+        <div class="finMiniBox"><span>PAGADA HISTÓRICAMENTE</span><b>${money(historico)}</b></div>
+        <div class="finMiniBox"><span>PRÓXIMO PAGO</span><b>${next ? next.due_date : '—'}</b>${next ? H`<small>${next.person} · ${money(next.amount)}</small>` : ''}</div>
+      </div>
 
-      ${state.debts.length ? raw(`<div class="finDebts">${state.debts.map((d) => {
-    const paid = d.status === 'paid';
-    return html`
-        <article class="finDebt ${paid ? 'is-paid' : ''}" data-debt="${d.id}">
-          <div class="finDebtTop">
-            <span class="finDebtState">${paid ? '✓ PAGADA' : '⏳ PENDIENTE'}</span>
-            <span class="finDebtAmt">${money(d.amount)}</span>
-          </div>
-          <b>${d.person}</b>
-          <p>${d.concept || 'Sin concepto'}</p>
-          <small>Creada ${d.created_date || '—'}${d.due_date ? ' · vence ' + d.due_date : ''}</small>
-          <div class="finDebtActions">
-            <button class="finBtn finBtn--sm" type="button" data-act="debt-toggle">${paid ? 'Marcar pendiente' : 'Marcar pagada'}</button>
-            <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act="debt-edit">Editar</button>
-            <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act="debt-del">Eliminar</button>
-          </div>
-        </article>`;
-  }).join('')}</div>`) : H`<div class="finEmpty">Sin deudas registradas. 🎉</div>`}
+      ${pendientes.length
+    ? H`<div class="finDebts">${raw(pendientes.map(debtHTML).join(''))}</div>`
+    : H`<div class="finEmpty">Sin deudas pendientes. 🎉</div>`}
+
+      ${pagadas.length ? H`
+        <details class="finDetails" style="margin-top:18px">
+          <summary>▸ Deudas archivadas (${num(pagadas.length)}) · ${money(historico)}</summary>
+          <div class="finDebts" style="padding-top:12px">${raw(pagadas.map(debtHTML).join(''))}</div>
+        </details>` : ''}
     </div>`;
 }
 
+/* ============================ vista: ESTADÍSTICAS ============================ */
 function donutHTML(slices, total, caption) {
   const R = 45; const W = 27; const C = 2 * Math.PI * R;
   let acc = 0;
@@ -457,18 +778,6 @@ function donutHTML(slices, total, caption) {
         <circle cx="60" cy="60" r="${R - W / 2}" fill="#fff"/></svg>`)}
       <figcaption><span>${caption}</span><b>${money(total)}</b></figcaption>
     </figure>`;
-}
-
-function breakdown(list, type) {
-  const map = new Map();
-  list.filter((t) => t.type === type).forEach((t) => {
-    const c = catById(t.category_id);
-    const key = c?.id || 'sin';
-    const prev = map.get(key) || { name: c?.name || 'Sin categoría', emoji: c?.emoji || '📦', value: 0 };
-    prev.value += n(t.amount);
-    map.set(key, prev);
-  });
-  return [...map.values()].sort((a, b) => b.value - a.value);
 }
 
 function chartCard({ tag, title, slices, total, lead }) {
@@ -493,137 +802,141 @@ function chartCard({ tag, title, slices, total, lead }) {
     </div>`;
 }
 
+function barListHTML(rows, total) {
+  return html`<div class="finBars">${raw(rows.map((r) => html`
+    <div class="finBarRow">
+      <span>${r.emoji} ${r.name}</span>
+      <b>${money(r.value)}</b>
+      <div class="finBar"><i style="width:${pct(r.value, total)}%"></i></div>
+      <small>${pct(r.value, total)}% · ${num(r.count)} ${r.count === 1 ? 'movimiento' : 'movimientos'}</small>
+    </div>`).join(''))}</div>`;
+}
+
 function viewEstadisticas() {
-  const list = periodTx();
-  const t = totals(list);
-  const gastos = breakdown(list, 'expense');
-  const ingresos = breakdown(list, 'income');
-  const label = state.period === 'all' ? 'Todo el historial'
-    : state.period === 'q' ? 'Últimos 3 meses'
-      : `${MESES[state.month - 1]} de ${state.year}`;
+  const eng = monthEngine();
+  const fm = freeMoney();
+  const real = eng.list.filter(isRealExpense);
+  const label = `${MESES[state.month - 1]} de ${state.year}`;
+
+  const gastos = breakdown(real, byCat);
+  const subs = breakdown(real, bySub).slice(0, 10);
+
+  // Comparación con el mes anterior, por categoría.
+  const py = state.month === 1 ? state.year - 1 : state.year;
+  const pm = state.month === 1 ? 12 : state.month - 1;
+  const prevEng = monthEngine(py, pm);
+  const prevReal = prevEng.list.filter(isRealExpense);
+  const prevMap = new Map(breakdown(prevReal, byCat).map((r) => [r.key, r]));
+  const curMap = new Map(gastos.map((r) => [r.key, r]));
+  const keys = new Set([...prevMap.keys(), ...curMap.keys()]);
+  const cmp = [...keys].map((k) => {
+    const c = curMap.get(k); const p = prevMap.get(k);
+    const cur = c?.value || 0; const prev = p?.value || 0;
+    return { name: (c || p).name, emoji: (c || p).emoji, cur, prev, delta: cur - prev };
+  });
+  const up = cmp.filter((r) => r.delta > 0).sort((a, b) => b.delta - a.delta);
+  const down = cmp.filter((r) => r.delta < 0).sort((a, b) => a.delta - b.delta);
+
+  const hormiga = hormigaTx(eng.list);
+  const hormigaTotal = sumBy(hormiga, amt);
+  const hormigaAvg = hormiga.length ? hormigaTotal / hormiga.length : 0;
+
+  const cmpRow = (r) => html`
+    <div class="finCmpRow">
+      <span>${r.emoji} ${r.name}</span>
+      <small>${money(r.prev)} → ${money(r.cur)}</small>
+      <b class="${r.delta > 0 ? 'up' : 'down'}">${r.delta > 0 ? '▲ +' : '▼ −'}${money(Math.abs(r.delta))}</b>
+    </div>`;
 
   return html`
     <div class="finPanel" style="margin-bottom:20px">
       <div class="finPanelHead">
-        <div><span class="finTag">Filtro único</span><h2>Estadísticas</h2><p>${label}</p></div>
-        <label class="finStatSel">Periodo
-          <select data-act="period">
-            <option value="month" ${state.period === 'month' ? 'selected' : ''}>Mes seleccionado</option>
-            <option value="q" ${state.period === 'q' ? 'selected' : ''}>Últimos 3 meses</option>
-            <option value="all" ${state.period === 'all' ? 'selected' : ''}>Todo</option>
-          </select>
-        </label>
+        <div><span class="finTag">Radiografía</span><h2>Estadísticas</h2><p>${label}</p></div>
       </div>
-      <div class="finTotals">
-        <div class="finStat finStat--in"><span>Ingresos</span><b>${money(t.income)}</b></div>
-        <div class="finStat finStat--out"><span>Gastos</span><b>${money(t.expense)}</b></div>
-        <div class="finStat finStat--bal"><span>Balance</span><b>${money(t.balance)}</b></div>
+      <div class="finStats finStats--six">
+        <div class="finStat finStat--in"><span>Ingresos del mes</span><b>${money(eng.t.income)}</b><small>sin contar reembolsos</small></div>
+        <div class="finStat finStat--out"><span>Gastos reales</span><b>${money(eng.t.expense)}</b><small>fijos ${money(eng.t.fixed)} · variables ${money(eng.t.variable)}</small></div>
+        <div class="finStat finStat--sav"><span>Ahorros realizados</span><b>${money(eng.t.saving)}</b><small>no cuentan como gasto</small></div>
+        <div class="finStat finStat--bal"><span>Saldo disponible</span><b>${money(fm.saldo)}</b><small>hoy, en la cuenta</small></div>
+        <div class="finStat finStat--free"><span>Dinero realmente libre</span><b>${money(fm.free)}</b><small>sin tocar obligaciones ni plan</small></div>
+        <div class="finStat"><span>Tasa de ahorro</span><b>${eng.savingRate}%</b><small>ahorro ÷ ingresos × 100</small></div>
+      </div>
+    </div>
+
+    <div class="finTwo" style="margin-bottom:20px">
+      <div class="finPanel">
+        <div class="finPanelHead"><div><span class="finTag finTag--lime">¿Voy bien?</span><h2>Ritmo del mes</h2></div></div>
+        <div class="finRhythm">
+          <div class="finRhythmRow">
+            <span>Ha transcurrido <b>${eng.elapsedPct}%</b> del mes</span>
+            <div class="finBar finBar--thin"><i style="width:${eng.elapsedPct}%"></i></div>
+          </div>
+          <div class="finRhythmRow">
+            <span>Has utilizado <b>${eng.usedPct}%</b> de tu presupuesto variable</span>
+            <div class="finBar finBar--thin ${eng.usedPct > eng.elapsedPct + 5 ? 'is-over' : ''}"><i style="width:${Math.min(100, eng.usedPct)}%"></i></div>
+          </div>
+          <div class="finPace finPace--${eng.pace.key}" style="margin:6px 0 0">${eng.pace.dot} ${eng.pace.text}</div>
+        </div>
+        <div class="finMini" style="margin-top:16px">
+          <div class="finMiniBox"><span>PROMEDIO DIARIO</span><b>${money(Math.round(eng.dailyAvg))}</b></div>
+          <div class="finMiniBox"><span>PROMEDIO SEMANAL</span><b>${money(Math.round(eng.weeklyAvg))}</b></div>
+          <div class="finMiniBox"><span>PRESUPUESTO VARIABLE</span><b>${money(eng.varBudget)}</b></div>
+        </div>
+        <p class="finNote">Solo cuenta el gasto variable real: los fijos se pagan una vez y los reembolsables no son tuyos.</p>
+      </div>
+
+      <div class="finPanel">
+        <div class="finPanelHead"><div><span class="finTag finTag--lime">Si sigues así</span><h2>Proyección de ${MESES[state.month - 1].toLowerCase()}</h2></div></div>
+        <div class="finProj">
+          <div class="finProjRow"><span>Gasto proyectado</span><b>${money(eng.projExpense)}</b><small>fijos ${money(eng.fixedPaid + eng.fixedPending)} + variables ${money(eng.projVar)}</small></div>
+          <div class="finProjRow"><span>Ahorro proyectado</span><b>${money(eng.projSaving)}</b><small>lo mayor entre ahorrado y planeado</small></div>
+          <div class="finProjRow ${eng.projFree < 0 ? 'is-neg' : ''}"><span>Disponible proyectado</span><b>${money(eng.projFree)}</b><small>ingreso esperado ${money(eng.expectedIncome)} − gasto − ahorro</small></div>
+        </div>
+        <p class="finNote">Usa tu promedio diario de gasto variable, los fijos que faltan por pagar y el ahorro planeado. Cambia sola con cada movimiento.</p>
+      </div>
+    </div>
+
+    <div class="finTwo" style="margin-bottom:20px">
+      ${raw(chartCard({
+    tag: '¿A dónde se fue?', title: 'Gasto por categoría', slices: gastos,
+    total: eng.t.expense, lead: 'Tu mayor categoría de gasto es',
+  }))}
+      <div class="finPanel">
+        <div class="finPanelHead"><div><span class="finTag finTag--lime">Al detalle</span><h2>Gasto por subcategoría</h2></div></div>
+        ${subs.length ? raw(barListHTML(subs, eng.t.expense)) : H`<div class="finEmpty">Sin gastos este mes.</div>`}
       </div>
     </div>
 
     <div class="finTwo">
-      ${raw(chartCard({
-    tag: '¿A dónde se fue?', title: 'Gastos por categoría', slices: gastos,
-    total: t.expense, lead: 'Tu mayor categoría de gasto es',
-  }))}
-      ${raw(chartCard({
-    tag: '¿De dónde llegó?', title: 'Ingresos por categoría', slices: ingresos,
-    total: t.income, lead: 'Tu principal fuente de ingresos es',
-  }))}
-    </div>`;
-}
-
-/* ============================ vista: CHECK LIST MENSUAL ============================ */
-/** Obligaciones que toca pagar en el mes que se está viendo. */
-function obligacionesDelMes() {
-  const { from: desde, to: hasta } = range();
-  const clave = periodoClave();
-  const pagados = new Set(state.checks.filter((c) => c.period === clave).map((c) => c.budget_id));
-
-  // Del presupuesto: gastos fijos y ahorros. Los variables son cupo, no obligación.
-  const delPlan = state.budgets
-    .filter((b) => b.active !== false && (b.kind === 'fixed' || b.kind === 'saving'))
-    .map((b) => ({
-      tipo: 'plan',
-      id: b.id,
-      nombre: b.name,
-      monto: n(b.amount),
-      grupo: KINDS[b.kind].label,
-      icono: KINDS[b.kind].line,
-      hecho: pagados.has(b.id),
-    }));
-
-  // Deudas que vencen dentro del mes (su estado sí es historial permanente).
-  const deudas = state.debts
-    .filter((d) => d.due_date && d.due_date >= desde && d.due_date <= hasta)
-    .map((d) => ({
-      tipo: 'deuda',
-      id: d.id,
-      nombre: d.person,
-      concepto: d.concept,
-      monto: n(d.amount),
-      grupo: 'Deudas',
-      icono: '💳',
-      vence: d.due_date,
-      hecho: d.status === 'paid',
-    }));
-
-  return { desde, hasta, items: [...delPlan, ...deudas] };
-}
-
-function viewChecklist() {
-  const { desde, hasta, items } = obligacionesDelMes();
-  const hechos = items.filter((i) => i.hecho);
-  const total = sumBy(items, (i) => i.monto);
-  const pagado = sumBy(hechos, (i) => i.monto);
-  const avance = pct(hechos.length, items.length);
-
-  const fila = (i) => html`
-    <button class="finCheck ${i.hecho ? 'is-done' : ''}" type="button"
-            data-check="${i.id}" data-tipo="${i.tipo}">
-      <span class="finCheckBox">✓</span>
-      <span class="finCheckText">
-        <b>${i.icono} ${i.nombre}</b>
-        <small>${i.grupo}${i.concepto ? ' · ' + i.concepto : ''}${i.vence ? ' · vence ' + i.vence : ''}</small>
-      </span>
-      <span class="finCheckAmt">${money(i.monto)}</span>
-    </button>`;
-
-  return html`
-    <div class="finPanel">
-      <div class="finPanelHead">
-        <div>
-          <span class="finTag finTag--lime">Lo que toca pagar</span>
-          <h2>Check List mensual</h2>
-          <p>${MESES[state.month - 1]} de ${state.year} · ${desde.slice(8)} al ${hasta.slice(8)}</p>
-        </div>
+      <div class="finPanel">
+        <div class="finPanelHead"><div><span class="finTag finTag--lime">Mes anterior</span><h2>Comparación</h2><p>${MESES[pm - 1]} ${money(prevEng.t.expense)} → ${MESES[state.month - 1]} ${money(eng.t.expense)}</p></div></div>
+        ${cmp.length ? H`
+          <p class="finGroupTitle">▲ Categorías que aumentaron</p>
+          ${up.length ? raw(up.map(cmpRow).join('')) : H`<p class="finNote" style="margin:4px 0 10px">Ninguna.</p>`}
+          <p class="finGroupTitle">▼ Categorías que disminuyeron</p>
+          ${down.length ? raw(down.map(cmpRow).join('')) : H`<p class="finNote" style="margin:4px 0 10px">Ninguna.</p>`}` : H`<div class="finEmpty">Sin datos para comparar.</div>`}
       </div>
 
-      <div class="finQProgress">
-        <div class="finQNums">
-          <b>${num(hechos.length)} de ${num(items.length)}</b>
-          <i>${money(pagado)} de ${money(total)}</i>
+      <div class="finPanel">
+        <div class="finPanelHead"><div><span class="finTag finTag--lime">Gastos hormiga</span><h2>Lo pequeño suma</h2></div></div>
+        <div class="finMini">
+          <div class="finMiniBox"><span>TOTAL DEL MES</span><b>${money(hormigaTotal)}</b></div>
+          <div class="finMiniBox"><span>MOVIMIENTOS</span><b>${num(hormiga.length)}</b></div>
+          <div class="finMiniBox"><span>PROMEDIO</span><b>${money(Math.round(hormigaAvg))}</b></div>
         </div>
-        <div class="finBar"><i style="width:${avance}%"></i></div>
-        <div class="finWeekFoot">
-          <span>${num(avance)}% del mes resuelto</span>
-          <span>${items.length === hechos.length && items.length ? '¡Todo al día! 🎉' : 'Quedan ' + money(total - pagado)}</span>
-        </div>
+        ${hormiga.length ? H`
+          <p class="finInsight">Mecato, cafés, snacks y antojos se llevan <b>${pct(hormigaTotal, eng.t.variable)}%</b> de tu gasto variable.
+          A este ritmo son <b>${money(Math.round(eng.elapsed ? (hormigaTotal / eng.elapsed) * eng.daysInMonth : 0))}</b> al mes.</p>
+          ${raw(barListHTML(breakdown(hormiga, (t) => ({ key: norm(t.description) || 'x', name: t.description || 'Sin descripción', emoji: subById(t.subcategory_id)?.emoji || '🍫' })).slice(0, 8), hormigaTotal))}`
+    : H`<div class="finEmpty">Sin gastos hormiga este mes. 👏</div>`}
+        <p class="finNote">Los gastos reembolsables (como el parqueadero del trabajo) no entran aquí.</p>
       </div>
-
-      ${items.length
-        ? H`<div class="finChecks">${raw(items.map(fila).join(''))}</div>`
-        : H`<div class="finEmpty">No hay obligaciones activas ni deudas con vencimiento en este mes.</div>`}
-
-      <p class="finNote">La lista empieza limpia cada mes y conserva las marcas de meses anteriores como historial.
-      Las deudas mantienen además su estado de pago.</p>
     </div>`;
 }
 
 /* ============================ pintado ============================ */
 const VIEWS = {
   movimientos: viewMovimientos,
-  checklist: viewChecklist,
   presupuesto: viewPresupuesto,
   ahorros: viewAhorros,
   categorias: viewCategorias,
@@ -706,18 +1019,21 @@ function exportarPDF(rango) {
   const t = totals(lista);
 
   const filas = lista.map((x) => {
-    const c = catById(x.category_id); const sub = subById(x.subcategory_id);
+    const c = catById(x.category_id); const sub = subById(x.subcategory_id); const g = goalById(x.goal_id);
+    let tipo = TX_LABEL[x.type] || x.type;
+    if (isReimbursable(x)) tipo += x.reimbursed_at ? ' (reembolsado)' : ' (reembolsable)';
+    const signo = isIncome(x) || isWithdrawal(x) ? '+' : '−';
     return `<tr>
       <td>${esc(x.transaction_date)}</td>
-      <td>${esc(x.description || sub?.name || c?.name || 'Movimiento')}</td>
-      <td>${esc([c?.name, sub?.name].filter(Boolean).join(' · '))}</td>
-      <td>${x.type === 'income' ? 'Ingreso' : 'Gasto'}</td>
-      <td class="r ${x.type}">${x.type === 'income' ? '+' : '−'} ${esc(money(x.amount))}</td>
+      <td>${esc(x.description || sub?.name || c?.name || g?.name || 'Movimiento')}</td>
+      <td>${esc(g ? 'Meta: ' + g.name : [c?.name, sub?.name].filter(Boolean).join(' · '))}</td>
+      <td>${esc(tipo)}</td>
+      <td class="r ${x.type}">${signo} ${esc(money(x.amount))}</td>
     </tr>`;
   }).join('');
 
   const deudas = state.debts.filter((d) => d.status !== 'paid');
-  const plan = state.budgets.filter((b) => b.active !== false);
+  const plan = activeBudgets();
 
   const hoja = document.createElement('div');
   hoja.id = 'printArea';
@@ -728,17 +1044,17 @@ function exportarPDF(rango) {
       <p>${esc(titulo)} · generado el ${esc(hoy)} · AS Suite v${esc(APP_VERSION)}</p>
     </header>
     <table class="tot">
-      <tr><th>Ingresos</th><th>Gastos</th><th>Balance</th></tr>
-      <tr><td>${esc(money(t.income))}</td><td>${esc(money(t.expense))}</td><td>${esc(money(t.balance))}</td></tr>
+      <tr><th>Ingresos</th><th>Gastos reales</th><th>Ahorro</th><th>Balance</th></tr>
+      <tr><td>${esc(money(t.income))}</td><td>${esc(money(t.expense))}</td><td>${esc(money(t.saving))}</td><td>${esc(money(t.income - t.expense - t.saving))}</td></tr>
     </table>
     <h2>Movimientos (${lista.length})</h2>
     ${lista.length ? `<table class="mov">
       <thead><tr><th>Fecha</th><th>Descripción</th><th>Categoría</th><th>Tipo</th><th class="r">Monto</th></tr></thead>
       <tbody>${filas}</tbody></table>` : '<p>Sin movimientos en este rango.</p>'}
-    ${plan.length ? `<h2>Plan del mes</h2>
+    ${plan.length ? `<h2>Plan</h2>
       <table class="mov"><thead><tr><th>Obligación</th><th>Grupo</th><th>Frecuencia</th><th class="r">Monto</th></tr></thead>
       <tbody>${plan.map((b) => `<tr><td>${esc(b.name)}</td><td>${esc(KINDS[b.kind]?.label || b.kind)}</td>
-        <td>Mensual</td>
+        <td>${b.period === 'week' ? 'Semanal' : 'Mensual'}</td>
         <td class="r">${esc(money(b.amount))}</td></tr>`).join('')}</tbody></table>` : ''}
     ${deudas.length ? `<h2>Deudas pendientes</h2>
       <table class="mov"><thead><tr><th>Persona</th><th>Concepto</th><th>Vence</th><th class="r">Monto</th></tr></thead>
@@ -760,38 +1076,6 @@ function exportarPDF(rango) {
 }
 
 /* ============================ menú de Finanzas ============================ */
-function menuSheet() {
-  const p = profile();
-  sheet({
-    title: 'Menú de Finanzas',
-    body: html`
-      <div class="finMenu">
-        <button class="finMenuItem" type="button" data-m="nombre">
-          <i>✍️</i><span><b>Cambiar nombre de usuario</b><small>Ahora eres “${p?.name || ''}”</small></span>
-        </button>
-        <button class="finMenuItem" type="button" data-m="pin">
-          <i>🔑</i><span><b>Cambiar PIN de seguridad</b><small>Cuatro dígitos, se guarda cifrado</small></span>
-        </button>
-        <button class="finMenuItem" type="button" data-m="pdf">
-          <i>📄</i><span><b>Exportar registros a PDF</b><small>Mes, año o todo el historial</small></span>
-        </button>
-        <button class="finMenuItem" type="button" data-m="colores">
-          <i>🎨</i><span><b>Personalizar colores</b><small>Acento de tu cuenta</small></span>
-        </button>
-        <button class="finMenuItem finMenuItem--soft" type="button" data-m="salir">
-          <i>🚪</i><span><b>Cerrar sesión</b><small>En este dispositivo</small></span>
-        </button>
-      </div>`,
-    onOpen: ({ root: r, close }) => {
-      $$('[data-m]', r).forEach((b) => b.addEventListener('click', () => {
-        close();
-        setTimeout(() => accionMenu(b.dataset.m), 190);
-      }));
-    },
-    actions: [{ label: 'Cerrar', onClick: ({ close }) => close() }],
-  });
-}
-
 function accionMenu(m) {
   const p = profile();
 
@@ -837,39 +1121,6 @@ function accionMenu(m) {
         }));
       },
       actions: [{ label: 'Cancelar', onClick: ({ close }) => close() }],
-    });
-  }
-
-  if (m === 'colores') {
-    return sheet({
-      title: 'Personalizar colores',
-      body: html`
-        <p class="sheetText">Elige el acento de tu cuenta. Todos mantienen el contraste
-        del sistema, así que la app sigue viéndose como debe.</p>
-        <div class="finAccents">
-          ${raw(Object.entries(ACCENTS).map(([k, a]) => `
-            <button class="finAccent" type="button" data-a="${esc(k)}"
-                    aria-current="${(p?.accent || 'lima') === k}">
-              <span style="background:${a.base}"></span>
-              <span style="background:${a.deep}"></span>
-              <b>${esc(a.label)}</b>
-            </button>`).join(''))}
-        </div>`,
-      onOpen: ({ root: r, close }) => {
-        $$('[data-a]', r).forEach((b) => b.addEventListener('click', async () => {
-          const key = b.dataset.a;
-          aplicarAcento({ accent: key });
-          $$('[data-a]', r).forEach((x) => x.setAttribute('aria-current', String(x === b)));
-          try {
-            await Finance.updateProfile(state.profileId, { accent: key });
-            const perfil = state.profiles.find((x) => x.id === state.profileId);
-            if (perfil) perfil.accent = key;
-            toast('Color aplicado');
-          } catch { toast('No se pudo guardar el color', 'err'); }
-          setTimeout(close, 450);
-        }));
-      },
-      actions: [{ label: 'Listo', onClick: ({ close }) => close() }],
     });
   }
 
@@ -928,6 +1179,24 @@ function optionList(items, selected, mapper) {
   }).join('');
 }
 
+/** Efecto de un movimiento sobre el saldo de su meta (+ ingreso, − retiro). */
+const goalDelta = (t) => (isSaving(t) ? amt(t) : isWithdrawal(t) ? -amt(t) : 0);
+
+async function applyGoal(goalId, delta) {
+  const g = goalById(goalId);
+  if (!g || !delta) return;
+  await Finance.updateGoal(g.id, { current: Math.max(0, n(g.current) + delta) });
+}
+
+/** Tipo de gasto según categoría (fijos mensuales) o presupuesto fijo vinculado. */
+function spendTypeFor(type, categoryId, subcategoryId) {
+  if (type === 'income') return 'income';
+  if (type === 'saving' || type === 'withdrawal') return 'saving';
+  if (catById(categoryId)?.kind === 'fixed') return 'fixed';
+  if (subcategoryId && fixedLines().some((b) => b.subcategory_id === subcategoryId)) return 'fixed';
+  return 'variable';
+}
+
 function txSheet(tx) {
   const editing = !!tx;
   const data = {
@@ -936,8 +1205,14 @@ function txSheet(tx) {
     date: tx?.transaction_date || todayISO(),
     category_id: tx?.category_id || '',
     subcategory_id: tx?.subcategory_id || '',
+    goal_id: tx?.goal_id || state.goals[0]?.id || '',
     description: tx?.description || '',
+    reimbursable: !!tx?.reimbursable,
+    reimburse_by: tx?.reimburse_by || '',
   };
+  const seg = data.type === 'income' ? 'income' : (data.type === 'expense' ? 'expense' : 'saving');
+  let segType = seg;
+  let savingDir = data.type === 'withdrawal' ? 'withdrawal' : 'saving';
 
   const catOpts = (type) => {
     const kinds = type === 'income' ? ['income'] : ['fixed', 'variable'];
@@ -949,26 +1224,52 @@ function txSheet(tx) {
     body: html`
       <div class="finForm">
         <div class="finSeg" data-seg="type">
-          <button type="button" data-v="expense" aria-pressed="${data.type === 'expense'}">Gasto</button>
-          <button type="button" data-v="income" aria-pressed="${data.type === 'income'}">Ingreso</button>
+          <button type="button" data-v="expense" aria-pressed="${segType === 'expense'}">Gasto</button>
+          <button type="button" data-v="income" aria-pressed="${segType === 'income'}">Ingreso</button>
+          <button type="button" data-v="saving" aria-pressed="${segType === 'saving'}">Ahorro</button>
+        </div>
+        <div class="finSeg finSeg--sub" data-seg="dir" ${segType === 'saving' ? '' : 'hidden'}>
+          <button type="button" data-v="saving" aria-pressed="${savingDir === 'saving'}">→ Ingresar a la meta</button>
+          <button type="button" data-v="withdrawal" aria-pressed="${savingDir === 'withdrawal'}">← Retirar de la meta</button>
         </div>
         ${raw(field('Monto', `<input type="text" inputmode="numeric" autocomplete="off" data-f="amount" value="${formatCOPInput(data.amount)}" placeholder="$0">`))}
         ${raw(field('Fecha', `<input type="date" data-f="date" value="${data.date}">`))}
-        <div class="finFieldRow">
-          ${raw(field('Categoría', `<select data-f="category_id"><option value="">— elige —</option>${
+        <div data-block="goal" ${segType === 'saving' ? '' : 'hidden'}>
+          ${raw(field('Meta de ahorro', `<select data-f="goal_id">${
+  optionList(state.goals, data.goal_id, (g) => ({ value: g.id, label: `🎯 ${g.name} · ${money(g.current)} / ${money(g.target)}` }))}</select>`))}
+        </div>
+        <div data-block="cats" ${segType === 'saving' ? 'hidden' : ''}>
+          <div class="finFieldRow">
+            ${raw(field('Categoría', `<select data-f="category_id"><option value="">— elige —</option>${
   optionList(catOpts(data.type), data.category_id, (c) => ({ value: c.id, label: `${c.emoji || ''} ${c.name}` }))}</select>`))}
-          <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act-local="cat-edit" aria-label="Modificar categoría">✎</button>
+            <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act-local="cat-edit" aria-label="Modificar categoría">✎</button>
+          </div>
+          <div class="finFieldRow" style="margin-top:14px">
+            ${raw(field('Subcategoría', '<select data-f="subcategory_id"><option value="">— elige —</option></select>'))}
+            <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act-local="sub-edit" aria-label="Modificar subcategoría">✎</button>
+          </div>
         </div>
-        <div class="finFieldRow">
-          ${raw(field('Subcategoría', '<select data-f="subcategory_id"><option value="">— elige —</option></select>'))}
-          <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act-local="sub-edit" aria-label="Modificar subcategoría">✎</button>
-        </div>
-        ${raw(field('Descripción', `<input type="text" data-f="description" list="txDescList" autocomplete="off" value="${esc(data.description)}" placeholder="Opcional">`))}
+        ${raw(field(segType === 'saving' && savingDir === 'withdrawal' ? 'Motivo' : 'Descripción', `<input type="text" data-f="description" list="txDescList" autocomplete="off" value="${esc(data.description)}" placeholder="Opcional">`))}
         ${raw(`<datalist id="txDescList">${descHistory().map((d) => `<option value="${esc(d)}">`).join('')}</datalist>`)}
+        <div data-block="reimb" ${segType === 'expense' ? '' : 'hidden'}>
+          <label class="finCheckbox">
+            <input type="checkbox" data-f="reimbursable" ${data.reimbursable ? 'checked' : ''}>
+            <span>Reembolsable · el dinero vuelve, no consume tu presupuesto</span>
+          </label>
+          <div data-block="payer" style="margin-top:12px" ${data.reimbursable ? '' : 'hidden'}>
+            ${raw(field('¿Quién reembolsa?', `<input type="text" data-f="reimburse_by" list="txPayerList" autocomplete="off" value="${esc(data.reimburse_by)}" placeholder="Dead Camera">`))}
+            ${raw(`<datalist id="txPayerList">${payerHistory().map((d) => `<option value="${esc(d)}">`).join('')}</datalist>`)}
+            ${tx?.reimbursed_at ? H`<p class="finNote" style="margin-top:8px">✓ Conciliado el ${tx.reimbursed_at.slice(0, 10)}.
+              <button class="finLink" type="button" data-act-local="unreconcile">Volver a pendiente</button></p>` : ''}
+          </div>
+        </div>
       </div>`,
     onOpen: ({ root: r, close }) => {
       const get = (f) => $(`[data-f="${f}"]`, r);
+      const block = (k) => $(`[data-block="${k}"]`, r);
+      let unreconcile = false;
       bindCOPInput(get('amount'));
+
       const paintSubs = () => {
         const sel = get('subcategory_id');
         const list = state.subs.filter((s) => s.category_id === get('category_id').value);
@@ -981,15 +1282,51 @@ function txSheet(tx) {
           + optionList(catOpts(data.type), data.category_id, (c) => ({ value: c.id, label: `${c.emoji || ''} ${c.name}` }));
         paintSubs();
       };
+      const syncBlocks = () => {
+        const saving = segType === 'saving';
+        $('[data-seg="dir"]', r).hidden = !saving;
+        block('goal').hidden = !saving;
+        block('cats').hidden = saving;
+        block('reimb').hidden = segType !== 'expense';
+        block('payer').hidden = !get('reimbursable').checked;
+        $('label', get('description').closest('.finField')).textContent = saving && savingDir === 'withdrawal' ? 'Motivo' : 'Descripción';
+      };
       paintSubs();
 
       $$('[data-seg="type"] button', r).forEach((btn) => btn.addEventListener('click', () => {
-        data.type = btn.dataset.v;
+        segType = btn.dataset.v;
+        data.type = segType === 'saving' ? savingDir : segType;
         $$('[data-seg="type"] button', r).forEach((b) => b.setAttribute('aria-pressed', String(b === btn)));
         data.category_id = ''; data.subcategory_id = '';
         paintCats();
+        syncBlocks();
+      }));
+      $$('[data-seg="dir"] button', r).forEach((btn) => btn.addEventListener('click', () => {
+        savingDir = btn.dataset.v;
+        data.type = savingDir;
+        $$('[data-seg="dir"] button', r).forEach((b) => b.setAttribute('aria-pressed', String(b === btn)));
+        syncBlocks();
       }));
       get('category_id').addEventListener('change', () => { data.subcategory_id = ''; paintSubs(); });
+      get('reimbursable').addEventListener('change', syncBlocks);
+
+      // Al repetir una descripción conocida se rellena lo demás como la última vez.
+      get('description').addEventListener('change', () => {
+        if (segType !== 'expense') return;
+        const key = norm(get('description').value);
+        if (!key) return;
+        const prev = state.tx.find((t) => isExpense(t) && norm(t.description) === key);
+        if (!prev) return;
+        if (!get('category_id').value && prev.category_id) {
+          data.category_id = prev.category_id; data.subcategory_id = prev.subcategory_id || '';
+          paintCats();
+        }
+        if (prev.reimbursable && !editing) {
+          get('reimbursable').checked = true;
+          get('reimburse_by').value = prev.reimburse_by || '';
+          syncBlocks();
+        }
+      });
 
       $('[data-act-local="cat-edit"]', r).addEventListener('click', () => {
         const cat = catById(get('category_id').value);
@@ -1002,31 +1339,53 @@ function txSheet(tx) {
         if (!sub) return toast('Elige una subcategoría primero', 'err');
         subSheet(catId, sub, () => { data.subcategory_id = sub.id; paintSubs(); });
       });
+      $('[data-act-local="unreconcile"]', r)?.addEventListener('click', (e) => {
+        unreconcile = true;
+        e.target.replaceWith('Se marcará como pendiente al guardar.');
+      });
 
       r.__save = async () => {
-        const categoryId = get('category_id').value || null;
+        const type = segType === 'saving' ? savingDir : segType;
+        const saving = type === 'saving' || type === 'withdrawal';
+        const categoryId = saving ? null : (get('category_id').value || null);
+        const subId = saving ? null : (get('subcategory_id').value || null);
+        const reimbursable = type === 'expense' && get('reimbursable').checked;
         const payload = {
           profile_id: state.profileId,
-          type: data.type,
+          type,
           amount: parseCOP(get('amount').value),
           transaction_date: get('date').value || todayISO(),
           category_id: categoryId,
-          subcategory_id: get('subcategory_id').value || null,
-          spend_type: spendTypeFor(data.type, categoryId),
+          subcategory_id: subId,
+          goal_id: saving ? (get('goal_id').value || null) : null,
+          spend_type: spendTypeFor(type, categoryId, subId),
           description: get('description').value.trim(),
+          reimbursable,
+          reimburse_by: reimbursable ? get('reimburse_by').value.trim() : '',
         };
+        if (!reimbursable || unreconcile) { payload.reimbursed_at = null; payload.reimbursement_id = null; }
         if (!Number.isSafeInteger(payload.amount) || payload.amount <= 0) {
           toast('Escribe un monto válido mayor que cero', 'err'); return;
         }
+        if (saving && !payload.goal_id) { toast('Crea una meta de ahorro primero', 'err'); return; }
         // El momento del movimiento se fija al crearlo y no se toca al editar,
         // para no reescribir la hora real de algo registrado antes.
         if (!editing) payload.occurred_at = new Date().toISOString();
         try {
-          if (editing) await Finance.updateTransaction(tx.id, payload);
-          else await Finance.addTransaction(payload);
+          if (editing) {
+            await Finance.updateTransaction(tx.id, payload);
+            // La meta se ajusta por diferencia: primero se deshace lo viejo, luego se aplica lo nuevo.
+            if (goalDelta(tx) || goalDelta(payload)) {
+              await applyGoal(tx.goal_id, -goalDelta(tx));
+              await applyGoal(payload.goal_id, goalDelta(payload));
+            }
+          } else {
+            await Finance.addTransaction(payload);
+            await applyGoal(payload.goal_id, goalDelta(payload));
+          }
           close();
           await loadAll({ silent: true });
-          toast(editing ? 'Movimiento actualizado' : 'Movimiento guardado');
+          toast(editing ? 'Movimiento actualizado' : (saving ? 'Ahorro registrado' : 'Movimiento guardado'));
         } catch { toast('No se pudo guardar', 'err'); }
       };
     },
@@ -1037,10 +1396,154 @@ function txSheet(tx) {
   });
 }
 
-function simpleSheet({ title, fields, onSave, onSaved }) {
+/** Ingresar o retirar dinero de una meta desde la pestaña Ahorros. */
+function goalMoveSheet(goal, dir) {
+  const deposit = dir === 'saving';
+  sheet({
+    title: deposit ? `Ingresar ahorro · ${goal.name}` : `Retirar de ${goal.name}`,
+    body: html`
+      <div class="finForm">
+        <p class="sheetText">${deposit
+    ? `Sale del saldo disponible y entra a la meta. Lleva ${money(goal.current)} de ${money(goal.target)}.`
+    : `Vuelve al saldo disponible. La meta tiene ${money(goal.current)}.`}</p>
+        ${raw(field('Monto', '<input type="text" inputmode="numeric" autocomplete="off" data-f="amount" placeholder="$0">'))}
+        ${raw(field('Fecha', `<input type="date" data-f="date" value="${todayISO()}">`))}
+        ${raw(field(deposit ? 'Nota (opcional)' : 'Motivo (opcional)', `<input type="text" data-f="description" placeholder="${deposit ? 'Quincena, extra…' : '¿Para qué lo sacas?'}">`))}
+      </div>`,
+    onOpen: ({ root: r, close }) => {
+      const get = (f) => $(`[data-f="${f}"]`, r);
+      bindCOPInput(get('amount'));
+      r.__save = async () => {
+        const amount = parseCOP(get('amount').value);
+        if (!Number.isSafeInteger(amount) || amount <= 0) return toast('Escribe un monto válido', 'err');
+        if (!deposit && amount > n(goal.current)) return toast('La meta no tiene tanto dinero', 'err');
+        const payload = {
+          profile_id: state.profileId,
+          type: dir,
+          amount,
+          transaction_date: get('date').value || todayISO(),
+          goal_id: goal.id,
+          spend_type: 'saving',
+          description: get('description').value.trim(),
+          occurred_at: new Date().toISOString(),
+        };
+        try {
+          await Finance.addTransaction(payload);
+          await applyGoal(goal.id, goalDelta(payload));
+          close();
+          await loadAll({ silent: true });
+          toast(deposit ? 'Ahorro ingresado 🐖' : 'Retiro registrado');
+        } catch { toast('No se pudo guardar', 'err'); }
+      };
+    },
+    actions: [
+      { label: 'Cancelar', onClick: ({ close }) => close() },
+      { label: deposit ? 'Ingresar' : 'Retirar', variant: 'primary', onClick: ({ root: r }) => r.__save?.() },
+    ],
+  });
+}
+
+/** Conciliar reembolsables: se marcan como recibidos y, si se quiere, se crea el ingreso. */
+function reconcileSheet() {
+  const re = reimbPending();
+  if (!re.items.length) return toast('No hay reembolsos pendientes');
+  const picked = new Set(re.items.map((t) => t.id));
+  const rowHTMLr = (t) => `
+    <button class="finCheck finCheck--pick is-done" type="button" data-re="${t.id}">
+      <span class="finCheckBox">✓</span>
+      <span class="finCheckText"><b>${esc(t.description || 'Gasto')}</b><small>${esc(t.transaction_date)} · ${esc(t.reimburse_by || 'Sin indicar')}</small></span>
+      <span class="finCheckAmt">${money(t.amount)}</span>
+    </button>`;
+
+  sheet({
+    title: 'Conciliar reembolsos',
+    body: html`
+      <p class="sheetText">Marca lo que ya te devolvieron. Pendiente: <b>${money(re.total)}</b>${re.by.length > 1 ? ' · ' + re.by.map(([k, v]) => `${k} ${money(v)}`).join(', ') : ''}.</p>
+      <div class="finChecks">${raw(re.items.map(rowHTMLr).join(''))}</div>
+      <div class="finForm" style="margin-top:14px">
+        <div class="finReTotal">Seleccionado: <b data-re-total>${money(re.total)}</b></div>
+        <label class="finCheckbox">
+          <input type="checkbox" data-f="create" checked>
+          <span>Crear el ingreso del reembolso automáticamente</span>
+        </label>
+        ${raw(field('Fecha en que llegó', `<input type="date" data-f="date" value="${todayISO()}">`))}
+      </div>`,
+    onOpen: ({ root: r, close }) => {
+      const get = (f) => $(`[data-f="${f}"]`, r);
+      const refresh = () => {
+        const total = sumBy(re.items.filter((t) => picked.has(t.id)), amt);
+        $('[data-re-total]', r).textContent = money(total);
+      };
+      $$('[data-re]', r).forEach((btn) => btn.addEventListener('click', () => {
+        const id = btn.dataset.re;
+        if (picked.has(id)) picked.delete(id); else picked.add(id);
+        btn.classList.toggle('is-done', picked.has(id));
+        refresh();
+      }));
+      r.__save = async () => {
+        const items = re.items.filter((t) => picked.has(t.id));
+        if (!items.length) return toast('Selecciona al menos uno', 'err');
+        const when = get('date').value || todayISO();
+        const payers = [...new Set(items.map((t) => (t.reimburse_by || '').trim()).filter(Boolean))];
+        try {
+          let incomeId = null;
+          if (get('create').checked) {
+            const income = await Finance.addTransaction({
+              profile_id: state.profileId,
+              type: 'income',
+              amount: sumBy(items, amt),
+              transaction_date: when,
+              category_id: refundCatId(),
+              subcategory_id: null,
+              spend_type: 'income',
+              description: `Reembolso ${payers.join(' + ') || ''}`.trim(),
+              occurred_at: new Date().toISOString(),
+            });
+            incomeId = income?.id || null;
+          }
+          const stamp = new Date(when + 'T12:00:00').toISOString();
+          await Promise.all(items.map((t) => Finance.updateTransaction(t.id, { reimbursed_at: stamp, reimbursement_id: incomeId })));
+          close();
+          await loadAll({ silent: true });
+          toast('Reembolsos conciliados ✓');
+        } catch { toast('No se pudo conciliar', 'err'); }
+      };
+    },
+    actions: [
+      { label: 'Cancelar', onClick: ({ close }) => close() },
+      { label: 'Conciliar', variant: 'primary', onClick: ({ root: r }) => r.__save?.() },
+    ],
+  });
+}
+
+/** Desglose del dinero realmente libre. */
+function freeSheet() {
+  const fm = freeMoney();
+  const line = (label, value, sign = '') => html`
+    <div class="finCalcRow ${sign === '−' ? 'is-minus' : sign === '+' ? 'is-plus' : ''}">
+      <span>${label}</span><b>${sign}${money(Math.abs(value))}</b>
+    </div>`;
+  sheet({
+    title: 'Dinero realmente libre',
+    body: html`
+      <div class="finCalc">
+        ${raw(line('Saldo disponible', fm.saldo))}
+        ${raw(line('Gastos fijos pendientes del mes', fm.fixedPending, '−'))}
+        ${raw(line('Presupuesto semanal protegido', fm.protectedBudget, '−'))}
+        ${raw(line('Deudas pendientes', fm.debts, '−'))}
+        ${raw(line('Reembolsos por recibir', fm.reimb, '+'))}
+        <div class="finCalcRow is-total"><span>Dinero realmente libre</span><b>${money(fm.free)}</b></div>
+      </div>
+      <p class="finNote">Es lo que puedes usar sin tocar obligaciones, presupuesto de la semana ni lo que falta del mes.
+      El presupuesto protegido es lo que te queda esta semana más las semanas que faltan del mes.</p>`,
+    actions: [{ label: 'Cerrar', onClick: ({ close }) => close() }],
+  });
+}
+
+function simpleSheet({ title, note, fields, onSave, onSaved }) {
   sheet({
     title,
-    body: html`<div class="finForm">${raw(fields.map((f) => {
+    body: html`${note ? H`<p class="sheetText">${note}</p>` : ''}<div class="finForm">${raw(fields.map((f) => {
       if (f.type === 'select') {
         return field(f.label, `<select data-f="${f.key}">${
           optionList(f.options, f.value, (o) => ({ value: o.value, label: o.label }))}</select>`);
@@ -1106,104 +1609,81 @@ function subSheet(catId, sub, onSaved) {
   });
 }
 
-function budgetSheet(b) {
+/** Formulario compartido por gastos fijos, ahorro planeado y categorías semanales. */
+function budgetSheet(b, { period = b?.period || 'month', kind = b?.kind || 'fixed' } = {}) {
+  const weekly = period === 'week';
   const data = {
+    name: b?.name || '',
     category_id: b?.category_id || '',
-    kind: b?.kind || 'fixed',
+    subcategory_id: b?.subcategory_id || '',
+    kind: weekly ? 'variable' : kind,
     amount: b ? n(b.amount) : '',
-    is_weekly: !!b?.is_weekly,
+    group_key: b?.group_key || 'need',
   };
   const catOpts = () => state.cats.filter((c) => c.kind === 'fixed' || c.kind === 'variable');
+  const titles = {
+    week: b ? 'Editar categoría semanal' : 'Nueva categoría semanal',
+    fixed: b ? 'Editar gasto fijo' : 'Nuevo gasto fijo',
+    saving: b ? 'Editar ahorro planeado' : 'Nuevo ahorro planeado',
+  };
 
   sheet({
-    title: b ? 'Editar obligación' : 'Nueva obligación',
+    title: titles[weekly ? 'week' : data.kind] || 'Presupuesto',
     body: html`
       <div class="finForm">
+        ${raw(field('Nombre', `<input type="text" data-f="name" value="${esc(data.name)}" placeholder="${weekly ? 'Mercado, Gasolina…' : 'Arriendo, Spotify…'}">`))}
+        ${raw(field(weekly ? 'Presupuesto semanal' : 'Monto del mes', `<input type="text" inputmode="numeric" autocomplete="off" data-f="amount" data-money value="${formatCOPInput(data.amount)}" placeholder="$0">`))}
+        ${weekly ? raw(field('Grupo', `<select data-f="group_key">
+          <option value="need" ${data.group_key === 'need' ? 'selected' : ''}>Necesidades</option>
+          <option value="life" ${data.group_key === 'life' ? 'selected' : ''}>Vida / disfrute</option>
+        </select>`)) : ''}
         ${raw(field('Categoría', `<select data-f="category_id"><option value="">— elige —</option>${
   optionList(catOpts(), data.category_id, (c) => ({ value: c.id, label: `${c.emoji || ''} ${c.name}` }))}</select>`))}
-        ${raw(field('Monto del mes', `<input type="text" inputmode="numeric" autocomplete="off" data-f="amount" data-money value="${formatCOPInput(data.amount)}" placeholder="$0">`))}
-        ${raw(field('Grupo', `<select data-f="kind">
-          <option value="fixed" ${data.kind === 'fixed' ? 'selected' : ''}>Gasto fijo</option>
-          <option value="variable" ${data.kind === 'variable' ? 'selected' : ''}>Gasto variable</option>
-          <option value="saving" ${data.kind === 'saving' ? 'selected' : ''}>Ahorro</option>
-        </select>`))}
-        <label class="finCheckbox">
-          <input type="checkbox" data-f="is_weekly" ${data.is_weekly ? 'checked' : ''}>
-          <span>Contar en el presupuesto semanal</span>
-        </label>
+        ${raw(field('Subcategoría (opcional)', '<select data-f="subcategory_id"><option value="">— toda la categoría —</option></select>'))}
+        <p class="finNote" style="margin:0">${weekly
+    ? 'Con subcategoría, solo cuentan esos gastos. Sin ella, cuenta toda la categoría salvo lo que ya tenga su propia línea.'
+    : 'La subcategoría sirve para detectar sola cuándo ya pagaste este fijo en el mes.'}</p>
       </div>`,
     onOpen: ({ root: r, close }) => {
       const get = (f) => $(`[data-f="${f}"]`, r);
       bindCOPInput(get('amount'));
+      const paintSubs = () => {
+        const list = state.subs.filter((s) => s.category_id === get('category_id').value);
+        get('subcategory_id').innerHTML = '<option value="">— toda la categoría —</option>'
+          + optionList(list, data.subcategory_id, (s) => ({ value: s.id, label: `${s.emoji || ''} ${s.name}` }));
+      };
+      paintSubs();
+      get('category_id').addEventListener('change', () => { data.subcategory_id = ''; paintSubs(); });
       r.__save = async () => {
-        const catId = get('category_id').value;
-        const cat = catById(catId);
-        if (!cat) return toast('Elige una categoría', 'err');
+        const catId = get('category_id').value || null;
+        if (weekly && !catId) return toast('Elige una categoría', 'err');
         const amount = parseCOP(get('amount').value);
         if (!Number.isFinite(amount) || amount < 0) return toast('Escribe un monto válido', 'err');
+        const name = get('name').value.trim() || catById(catId)?.name || '';
+        if (!name) return toast('Escribe un nombre', 'err');
         const payload = {
           profile_id: state.profileId,
-          category_id: cat.id,
-          name: cat.name,
-          kind: get('kind').value,
+          category_id: catId,
+          subcategory_id: get('subcategory_id').value || null,
+          name,
+          kind: data.kind,
           amount,
-          is_weekly: get('is_weekly').checked,
+          period,
+          is_weekly: weekly,
+          group_key: weekly ? get('group_key').value : '',
         };
         try {
           if (b) await Finance.updateBudget(b.id, payload);
           else await Finance.addBudget(payload);
           close();
           await loadAll({ silent: true });
-          toast(b ? 'Obligación actualizada' : 'Obligación guardada');
+          toast(b ? 'Presupuesto actualizado' : 'Presupuesto guardado');
         } catch { toast('No se pudo guardar', 'err'); }
       };
     },
     actions: [
       { label: 'Cancelar', onClick: ({ close }) => close() },
       { label: 'Guardar', variant: 'primary', onClick: ({ root: r }) => r.__save?.() },
-    ],
-  });
-}
-
-function weekPickSheet() {
-  const options = state.budgets.filter((x) => x.active !== false && (x.kind === 'fixed' || x.kind === 'variable'));
-  const picked = new Map(options.map((b) => [b.id, !!b.is_weekly]));
-  const rowHTML = (b) => `
-    <button class="finCheck ${picked.get(b.id) ? 'is-done' : ''}" type="button" data-wk="${b.id}">
-      <span class="finCheckBox">✓</span>
-      <span class="finCheckText"><b>${esc(b.name)}</b><small>${esc(KINDS[b.kind]?.label || b.kind)}</small></span>
-      <span class="finCheckAmt">${money(b.amount)}</span>
-    </button>`;
-
-  sheet({
-    title: 'Presupuesto semanal',
-    body: html`
-      <p class="sheetText">Elige qué obligaciones, fijas o variables, quieres seguir semana a semana.</p>
-      ${options.length
-    ? H`<div class="finChecks">${raw(options.map(rowHTML).join(''))}</div>`
-    : H`<div class="finEmpty">Agrega obligaciones primero.</div>`}`,
-    onOpen: ({ root: r }) => {
-      $$('[data-wk]', r).forEach((btn) => btn.addEventListener('click', () => {
-        const id = btn.dataset.wk;
-        picked.set(id, !picked.get(id));
-        btn.classList.toggle('is-done', picked.get(id));
-      }));
-    },
-    actions: [
-      { label: 'Cancelar', onClick: ({ close }) => close() },
-      {
-        label: 'Guardar',
-        variant: 'primary',
-        onClick: async ({ close }) => {
-          const changed = options.filter((b) => picked.get(b.id) !== !!b.is_weekly);
-          try {
-            await Promise.all(changed.map((b) => Finance.updateBudget(b.id, { is_weekly: picked.get(b.id) })));
-            close();
-            await loadAll({ silent: true });
-            toast('Presupuesto semanal actualizado');
-          } catch { toast('No se pudo guardar', 'err'); }
-        },
-      },
     ],
   });
 }
@@ -1223,47 +1703,9 @@ function wire() {
   if (root.dataset.finWired) return;
   root.dataset.finWired = '1';
 
-  root.addEventListener('change', (e) => {
-    if (e.target.dataset.act === 'period') { state.period = e.target.value; paint(); }
-  });
-
   root.addEventListener('click', async (e) => {
     const tab = e.target.closest('[data-tab]');
     if (tab) { state.tab = tab.dataset.tab; paint(); return; }
-
-    /* --- check list mensual --- */
-    const check = e.target.closest('[data-check]');
-    if (check) {
-      const id = check.dataset.check;
-      const tipo = check.dataset.tipo;
-      const clave = periodoClave();
-
-      if (tipo === 'deuda') {
-        const d = state.debts.find((x) => x.id === id);
-        const pagada = d?.status === 'paid';
-        if (d) d.status = pagada ? 'pending' : 'paid';   // respuesta inmediata
-        paint();
-        try {
-          await Finance.updateDebt(id, {
-            status: pagada ? 'pending' : 'paid',
-            paid_at: pagada ? null : new Date().toISOString(),
-          });
-          toast(pagada ? 'Deuda de nuevo pendiente' : 'Deuda pagada ✓');
-        } catch { toast('No se pudo actualizar', 'err'); loadAll({ silent: true }); }
-        return;
-      }
-
-      const yaEsta = state.checks.some((c) => c.budget_id === id && c.period === clave);
-      state.checks = yaEsta
-        ? state.checks.filter((c) => !(c.budget_id === id && c.period === clave))
-        : [...state.checks, { budget_id: id, period: clave, profile_id: state.profileId }];
-      paint();
-      try {
-        if (yaEsta) await Checks.unmark(id, clave);
-        else await Checks.mark(state.profileId, id, clave);
-      } catch { toast('No se pudo guardar la marca', 'err'); loadAll({ silent: true }); }
-      return;
-    }
 
     const btn = e.target.closest('[data-act]');
     if (!btn) return;
@@ -1273,13 +1715,25 @@ function wire() {
     if (act === 'prev') return shiftMonth(-1);
     if (act === 'next') return shiftMonth(1);
     if (act === 'tools') return accionMenu('pdf');
-    if (act === 'week-pick') return weekPickSheet();
+    if (act === 'wk-prev') { state.weekOffset -= 1; return paint(); }
+    if (act === 'wk-next') { state.weekOffset += 1; return paint(); }
+    if (act === 'free-detail') return freeSheet();
+    if (act === 'reconcile') return reconcileSheet();
 
     if (act === 'base') {
       return simpleSheet({
-        title: 'Ingreso base del mes',
+        title: 'Ingreso esperado del mes',
+        note: 'Tu sueldo u otros ingresos fijos. Sirve para la proyección: los gastos fijos nunca se muestran como dinero libre.',
         fields: [{ key: 'base_income', label: 'Ingreso base', type: 'number', value: n(p?.base_income) }],
         onSave: (v) => Finance.updateProfile(state.profileId, { base_income: n(v.base_income) }),
+      });
+    }
+    if (act === 'opening') {
+      return simpleSheet({
+        title: 'Saldo inicial',
+        note: `El saldo disponible se calcula sumando todos tus movimientos a este saldo inicial. Hoy marca ${money(saldo())}: ajusta el inicial para que coincida con tu cuenta.`,
+        fields: [{ key: 'opening_balance', label: 'Saldo inicial', type: 'number', value: n(p?.opening_balance) }],
+        onSave: (v) => Finance.updateProfile(state.profileId, { opening_balance: n(v.opening_balance) }),
       });
     }
 
@@ -1290,29 +1744,40 @@ function wire() {
       const tx = state.tx.find((t) => t.id === id);
       if (act === 'tx-edit') return txSheet(tx);
       return confirmSheet('Eliminar movimiento', '¿Borrar este movimiento? No se puede deshacer.', async () => {
-        try { await Finance.removeTransaction(id); await loadAll({ silent: true }); toast('Movimiento eliminado'); }
-        catch { toast('No se pudo eliminar', 'err'); }
+        try {
+          await Finance.removeTransaction(id);
+          await applyGoal(tx?.goal_id, -goalDelta(tx || {}));
+          await loadAll({ silent: true });
+          toast('Movimiento eliminado');
+        } catch { toast('No se pudo eliminar', 'err'); }
       });
     }
 
     /* --- presupuesto --- */
-    if (act === 'bud-new' || act === 'bud-edit') {
+    if (act === 'bud-new') return budgetSheet(null, { period: 'month', kind: btn.dataset.kind || 'fixed' });
+    if (act === 'wk-new') return budgetSheet(null, { period: 'week' });
+    if (act === 'bud-edit' || act === 'wk-edit') {
       const id = btn.closest('[data-budget]')?.dataset.budget;
       const b = state.budgets.find((x) => x.id === id);
       return budgetSheet(b);
     }
     if (act === 'bud-del') {
       const id = btn.closest('[data-budget]').dataset.budget;
-      return confirmSheet('Eliminar obligación', '¿Quitarla del plan del mes?', async () => {
-        try { await Finance.removeBudget(id); await loadAll({ silent: true }); toast('Obligación eliminada'); }
+      return confirmSheet('Eliminar del plan', '¿Quitar esta línea del presupuesto? Los movimientos no se tocan.', async () => {
+        try { await Finance.removeBudget(id); await loadAll({ silent: true }); toast('Línea eliminada'); }
         catch { toast('No se pudo eliminar', 'err'); }
       });
     }
 
     /* --- metas --- */
+    if (act === 'goal-in' || act === 'goal-out') {
+      const id = btn.closest('[data-goal]').dataset.goal;
+      const g = goalById(id);
+      return g && goalMoveSheet(g, act === 'goal-in' ? 'saving' : 'withdrawal');
+    }
     if (act === 'goal-new' || act === 'goal-edit' || act === 'goal-img') {
       const id = btn.closest('[data-goal]')?.dataset.goal;
-      const g = state.goals.find((x) => x.id === id);
+      const g = goalById(id);
       return simpleSheet({
         title: g ? 'Editar meta' : 'Nueva meta',
         fields: [
@@ -1337,7 +1802,7 @@ function wire() {
     }
     if (act === 'goal-del') {
       const id = btn.closest('[data-goal]').dataset.goal;
-      return confirmSheet('Eliminar meta', '¿Borrar esta meta de ahorro?', async () => {
+      return confirmSheet('Eliminar meta', '¿Borrar esta meta de ahorro? Los movimientos de ahorro quedan en el historial.', async () => {
         try { await Finance.removeGoal(id); await loadAll({ silent: true }); toast('Meta eliminada'); }
         catch { toast('No se pudo eliminar', 'err'); }
       });
@@ -1380,7 +1845,7 @@ function wire() {
           { key: 'person', label: 'Persona o entidad', value: d?.person || '' },
           { key: 'concept', label: 'Concepto', value: d?.concept || '' },
           { key: 'amount', label: 'Monto', type: 'number', value: d ? n(d.amount) : '' },
-          { key: 'due_date', label: 'Vence', type: 'date', value: d?.due_date || '' },
+          { key: 'due_date', label: 'Próximo pago / vence', type: 'date', value: d?.due_date || '' },
         ],
         onSave: (v) => {
           const payload = {
@@ -1402,13 +1867,13 @@ function wire() {
       try {
         await Finance.updateDebt(id, { status: paid ? 'pending' : 'paid', paid_at: paid ? null : new Date().toISOString() });
         await loadAll({ silent: true });
-        toast(paid ? 'Marcada como pendiente' : 'Deuda pagada ✓');
+        toast(paid ? 'Marcada como pendiente' : 'Deuda pagada y archivada ✓');
       } catch { toast('No se pudo actualizar', 'err'); }
       return;
     }
     if (act === 'debt-del') {
       const id = btn.closest('[data-debt]').dataset.debt;
-      return confirmSheet('Eliminar deuda', '¿Borrar esta obligación?', async () => {
+      return confirmSheet('Eliminar deuda', '¿Borrar esta obligación del historial?', async () => {
         try { await Finance.removeDebt(id); await loadAll({ silent: true }); toast('Deuda eliminada'); }
         catch { toast('No se pudo eliminar', 'err'); }
       });
@@ -1426,6 +1891,7 @@ export async function render(container) {
   state.year = Number(today.slice(0, 4));
   state.month = Number(today.slice(5, 7));
   state.tab = 'movimientos';
+  state.weekOffset = 0;
 
   hydrate();
   aplicarAcento(profile());
@@ -1436,7 +1902,7 @@ export async function render(container) {
   catch { if (!state.loaded) toast('Sin conexión: mostrando lo último guardado', 'err'); }
 
   watch('finance', ['finance_transactions', 'budgets', 'savings_goals', 'debts',
-    'finance_categories', 'finance_subcategories', 'profiles', 'budget_checks'],
+    'finance_categories', 'finance_subcategories', 'profiles'],
   () => loadAll({ silent: true }));
 }
 

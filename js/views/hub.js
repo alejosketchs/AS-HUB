@@ -196,9 +196,12 @@ export async function render(root) {
     const late = open.filter((t) => t.due_date && t.due_date < today).length;
     const doneToday = tasks.filter((t) => t.status === 'done' && dayOf(t.completed_at) === today).length;
 
-    const spent = txs.filter((t) => t.type === 'expense').reduce((s, t) => s + Number(t.amount), 0);
+    // Gasto real: sin reembolsables (vuelven) ni ahorros (no son gasto).
+    const spent = txs.filter((t) => t.type === 'expense' && !t.reimbursable).reduce((s, t) => s + Number(t.amount), 0);
     const income = txs.filter((t) => t.type === 'income').reduce((s, t) => s + Number(t.amount), 0);
-    const planned = budgets.filter((b) => b.active).reduce((s, b) => s + Number(b.amount), 0);
+    // Plan del mes: fijos + ahorro planeado + semanales llevados a mes.
+    const planned = budgets.filter((b) => b.active !== false && b.kind !== 'saving')
+      .reduce((s, b) => s + Number(b.amount) * (b.period === 'week' ? 4.33 : 1), 0);
 
     const tChips = [chip(`${open.length} abiertas`), chip(`${dueToday} para hoy`)];
     if (late) tChips.push(chip(`⚠ ${late} vencidas`));

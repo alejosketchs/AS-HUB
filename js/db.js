@@ -224,23 +224,6 @@ export const Settings = {
   },
 };
 
-/* ---------- CHECK LIST MENSUAL ---------- */
-export const Checks = {
-  /** El periodo mensual usa la forma YYYY-MM; las marcas históricas no se eliminan. */
-  async list(profileId, periodo) {
-    return unwrap(await sb.from('budget_checks').select('*')
-      .eq('profile_id', profileId).eq('period', periodo));
-  },
-  async mark(profileId, budgetId, period) {
-    return unwrap(await sb.from('budget_checks')
-      .upsert({ profile_id: profileId, budget_id: budgetId, period }, { onConflict: 'budget_id,period' })
-      .select().single());
-  },
-  async unmark(budgetId, period) {
-    return unwrap(await sb.from('budget_checks').delete().eq('budget_id', budgetId).eq('period', period));
-  },
-};
-
 /* ---------- realtime ---------- */
 const channels = new Map();
 
