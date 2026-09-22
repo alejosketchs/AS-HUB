@@ -15,6 +15,9 @@ const READER_URL = 'https://as-reader-as24-b7b9.vercel.app/';
    Aquí solo se enlaza con la sesión puesta para que no pida PIN otra vez. */
 const MEMO_URL = 'https://as-memo.vercel.app/';
 
+/* AS Piano no usa Supabase ni PIN: todo el progreso vive en el dispositivo. */
+const PIANO_URL = 'https://as-piano.vercel.app/';
+
 function fraseDelDia() {
   const iso = todayISO();
   const seed = Number(iso.replaceAll('-', '')) % FRASES.length;
@@ -95,6 +98,16 @@ function shell(nombre) {
           <h2>Memo Recall</h2>
           <p>Flashcards con repetición espaciada, IA y niveles para fijar lo que estudias.</p>
           <div class="appStats">${raw(chip('Decks') + chip('XP') + chip('Racha'))}</div>
+          <div class="appOpen">ABRIR <b>↗</b></div>
+        </a>
+
+        <a class="appCard tilt-a" href="${PIANO_URL}" target="_blank" rel="noopener" style="--accent:var(--blue)">
+          <span class="appNum">#05</span>
+          <div class="appIcon">♪</div>
+          <p class="appLabel">TOCA · ESCUCHA · IMPROVISA</p>
+          <h2>AS Piano</h2>
+          <p>Escalas con metrónomo, banda para improvisar y grados armónicos en las 24 tonalidades.</p>
+          <div class="appStats">${raw(chip('Escalas') + chip('Backing tracks') + chip('Grados'))}</div>
           <div class="appOpen">ABRIR <b>↗</b></div>
         </a>
       </div>
