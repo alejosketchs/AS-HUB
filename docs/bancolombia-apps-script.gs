@@ -7,9 +7,10 @@
  */
 
 const CONFIG = {
-  // Ajusta esto cuando tengas correos reales: entre más específico el
-  // remitente, menos ruido. Mientras tanto busca "bancolombia" en todo el correo.
-  GMAIL_SEARCH_QUERY: 'bancolombia (compra OR pago OR retiro OR transferencia OR consignacion OR abono) newer_than:7d',
+  // Las alertas reales de movimientos llegan con este asunto exacto
+  // ("Alertas y Notificaciones"); así se evita capturar promociones del
+  // banco que también mencionan "compra" o "transferencia" en el cuerpo.
+  GMAIL_SEARCH_QUERY: 'subject:"Alertas y Notificaciones" newer_than:7d',
   LABEL_NAME: 'AS-procesado',
   ENDPOINT_URL: 'https://derzetuipyugmrjaxcyu.supabase.co/functions/v1/bancolombia-ingest',
   MAX_THREADS_PER_RUN: 20,
