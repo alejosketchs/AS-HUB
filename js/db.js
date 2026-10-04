@@ -179,6 +179,21 @@ export const Finance = {
   async addDebt(d) { return unwrap(await sb.from('debts').insert(d).select().single()); },
   async updateDebt(id, patch) { return unwrap(await sb.from('debts').update(patch).eq('id', id).select().single()); },
   async removeDebt(id) { return unwrap(await sb.from('debts').delete().eq('id', id)); },
+
+  /* Mapeo de tarjeta/cuenta (últimos 4 dígitos) -> perfil, para la ingesta automática. */
+  async cardProfiles() {
+    return unwrap(await sb.from('finance_card_profiles').select('*').order('created_at'));
+  },
+  async addCardProfile(c) { return unwrap(await sb.from('finance_card_profiles').insert(c).select().single()); },
+  async updateCardProfile(id, patch) { return unwrap(await sb.from('finance_card_profiles').update(patch).eq('id', id).select().single()); },
+  async removeCardProfile(id) { return unwrap(await sb.from('finance_card_profiles').delete().eq('id', id)); },
+
+  /* Bandeja de correos del banco que el parser no pudo aplicar solo. */
+  async inboxPending() {
+    return unwrap(await sb.from('finance_email_inbox').select('*')
+      .eq('status', 'pending_review').order('received_at', { ascending: false }));
+  },
+  async updateInbox(id, patch) { return unwrap(await sb.from('finance_email_inbox').update(patch).eq('id', id).select().single()); },
 };
 
 /* ---------- SESIÓN DEL SUITE ---------- */

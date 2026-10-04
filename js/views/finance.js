@@ -2,7 +2,7 @@
 import { Finance, watch, unwatch, readCache, writeCache } from '../db.js';
 import {
   $, $$, html, raw, esc, money, num, toast, sheet, confirmSheet,
-  todayISO, addDays, monthRange, pct,
+  todayISO, addDays, monthRange, pct, dayOf,
 } from '../ui.js';
 import { TZ, ACCENTS, APP_VERSION } from '../config.js';
 import { perfilActivo, hashPin, cambiarPin, cerrarSesion } from '../session.js';
@@ -64,6 +64,7 @@ let state = {
   year: 0, month: 0,
   weekOffset: 0,
   profiles: [], cats: [], subs: [], tx: [], budgets: [], goals: [], debts: [],
+  cardProfiles: [], inboxPending: [],
   loaded: false,
 };
 
@@ -346,12 +347,13 @@ function hormigaTx(list) {
 /* ============================ carga ============================ */
 async function loadAll({ silent = false } = {}) {
   const pid = state.profileId;
-  const [profiles, cats, subs, tx, budgets, goals, debts] = await Promise.all([
+  const [profiles, cats, subs, tx, budgets, goals, debts, cardProfiles, inboxPending] = await Promise.all([
     Finance.profiles(), Finance.categories(), Finance.subcategories(),
     Finance.allTransactions(pid), Finance.budgets(pid), Finance.goals(pid), Finance.debts(pid),
+    Finance.cardProfiles(), Finance.inboxPending(),
   ]);
-  Object.assign(state, { profiles, cats, subs, tx, budgets, goals, debts, loaded: true });
-  writeCache('fin:' + pid, { profiles, cats, subs, tx, budgets, goals, debts });
+  Object.assign(state, { profiles, cats, subs, tx, budgets, goals, debts, cardProfiles, inboxPending, loaded: true });
+  writeCache('fin:' + pid, { profiles, cats, subs, tx, budgets, goals, debts, cardProfiles, inboxPending });
   aplicarAcento(profiles.find((x) => x.id === pid));
   if (!silent) toast('Finanzas al día');
   paint();
@@ -414,17 +416,20 @@ function rowHTML(t) {
   let chip = '';
   if (isReimbursable(t)) {
     chip = t.reimbursed_at
-      ? H`<em class="finChip finChip--ok">✓ Reembolsado${t.reimburse_by ? ' · ' + t.reimburse_by : ''}</em>`
-      : H`<em class="finChip finChip--re">↩ Reembolsable${t.reimburse_by ? ' · ' + t.reimburse_by : ''}</em>`;
+      ? `<em class="finChip finChip--ok">✓ Reembolsado${t.reimburse_by ? ' · ' + esc(t.reimburse_by) : ''}</em>`
+      : `<em class="finChip finChip--re">↩ Reembolsable${t.reimburse_by ? ' · ' + esc(t.reimburse_by) : ''}</em>`;
   } else if (isRefund(t)) {
-    chip = H`<em class="finChip finChip--ok">↩ Reembolso recibido</em>`;
+    chip = '<em class="finChip finChip--ok">↩ Reembolso recibido</em>';
   }
+  const auto = t.source === 'automatico';
+  if (auto) chip += '<em class="finChip finChip--auto">🤖 Automático</em>';
   return html`
     <div class="finRow ${cls}" data-tx="${t.id}">
       <div class="finRowIcon">${icon}</div>
-      <div class="finRowText"><b>${title}</b><small>${meta}</small>${chip}</div>
+      <div class="finRowText"><b>${title}</b><small>${meta}</small>${raw(chip)}</div>
       <div class="finRowAmt">${sign}${money(t.amount)}</div>
       <div class="finIcons">
+        ${auto ? H`<button type="button" data-act="tx-audit" aria-label="Ver correo original">🧾</button>` : ''}
         <button type="button" data-act="tx-edit" aria-label="Editar">✎</button>
         <button type="button" data-act="tx-del" aria-label="Eliminar">✕</button>
       </div>
@@ -702,7 +707,108 @@ function viewCategorias() {
       </div>
       ${raw(section('Gastos', '💸', state.cats.filter((c) => c.kind === 'fixed' || c.kind === 'variable'), 'variable'))}
       ${raw(section('Ingresos', KINDS.income.emoji, state.cats.filter((c) => c.kind === 'income'), 'income'))}
+    </div>
+    ${raw(viewAutomatizacion())}`;
+}
+
+/* ============================ tarjetas/cuentas -> perfil ============================ */
+function viewAutomatizacion() {
+  const rows = state.cardProfiles.map((c) => {
+    const p = state.profiles.find((x) => x.id === c.profile_id);
+    return html`
+      <div class="finLine" data-card="${c.id}">
+        <span>${c.active ? '🔗' : '⏸️'} •••• ${c.last4} <small>${p?.emoji || ''} ${p?.name || c.profile_id}${c.label ? ' · ' + c.label : ''}</small></span>
+        <span class="finIcons" style="flex:none">
+          <button type="button" data-act="card-edit" aria-label="Editar">✎</button>
+          <button type="button" data-act="card-del" aria-label="Eliminar">✕</button>
+        </span>
+      </div>`;
+  }).join('');
+  return html`
+    <div class="finPanel" style="margin-top:20px">
+      <div class="finPanelHead">
+        <div><span class="finTag finTag--lime">Ingesta automática</span><h2>Tarjetas y cuentas → perfil</h2>
+        <p>Así sabe a quién asignar cada alerta de Bancolombia según los últimos 4 dígitos.</p></div>
+        <button class="finBtn finBtn--sm" type="button" data-act="card-new">+ Tarjeta o cuenta</button>
+      </div>
+      ${state.cardProfiles.length ? raw(rows) : H`<div class="finEmpty">Sin tarjetas/cuentas mapeadas todavía: las alertas quedarán en la bandeja de revisión.</div>`}
     </div>`;
+}
+
+function cardProfileSheet(c) {
+  return simpleSheet({
+    title: c ? 'Editar tarjeta/cuenta' : 'Nueva tarjeta o cuenta',
+    note: 'Los últimos 4 dígitos vienen tal cual en la alerta del banco ("terminada en 1234" o "cuenta *1234").',
+    fields: [
+      {
+        key: 'profile_id', label: 'Perfil', type: 'select', value: c?.profile_id || state.profileId,
+        options: state.profiles.map((p) => ({ value: p.id, label: `${p.emoji || ''} ${p.name}` })),
+      },
+      { key: 'last4', label: 'Últimos 4 dígitos', value: c?.last4 || '', placeholder: '1234' },
+      { key: 'label', label: 'Etiqueta (opcional)', value: c?.label || '', placeholder: 'Tarjeta débito' },
+    ],
+    onSave: (v) => {
+      const last4 = v.last4.trim();
+      if (!/^\d{4}$/.test(last4)) throw new Error('Los últimos 4 dígitos deben ser 4 números');
+      const payload = { profile_id: v.profile_id, last4, label: v.label.trim() };
+      return c ? Finance.updateCardProfile(c.id, payload) : Finance.addCardProfile({ ...payload, active: true });
+    },
+  });
+}
+
+/* ============================ bandeja de revisión ============================ */
+function inboxItemHTML(item) {
+  const p = item.parsed;
+  const guess = p ? `${p.type === 'income' ? '+' : '−'} ${money(p.amount)} · ${p.description}${p.last4 ? ' · ••••' + p.last4 : ''}`
+    : 'No se reconoció el formato del correo';
+  return html`
+    <div class="finLine" data-inbox="${item.id}" style="flex-wrap:wrap">
+      <span><b>${item.subject || 'Correo de Bancolombia'}</b><small>${timeOf(item.received_at) ? dateAt(item.received_at.slice(0, 10)).toLocaleDateString('es-CO') + ' · ' : ''}${guess}</small></span>
+      <span class="finIcons" style="flex:none">
+        <button class="finBtn finBtn--sm" type="button" data-act="inbox-complete">Completar</button>
+        <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act="inbox-ignore">Ignorar</button>
+      </span>
+    </div>`;
+}
+
+function inboxSheet() {
+  sheet({
+    title: 'Bandeja de revisión',
+    body: html`
+      <p class="sheetText">Correos del banco que no se pudieron asignar solos: formato no reconocido o tarjeta/cuenta sin mapear.</p>
+      <div class="finLines">${state.inboxPending.length ? raw(state.inboxPending.map(inboxItemHTML).join(''))
+    : H`<div class="finEmpty">Sin pendientes 🎉</div>`}</div>`,
+    onOpen: ({ root: r, close }) => {
+      r.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-act]');
+        if (!btn) return;
+        const id = btn.closest('[data-inbox]').dataset.inbox;
+        const item = state.inboxPending.find((x) => x.id === id);
+        if (!item) return;
+        if (btn.dataset.act === 'inbox-ignore') {
+          return confirmSheet('Ignorar correo', 'No se creará ningún movimiento a partir de este correo.', async () => {
+            try { await Finance.updateInbox(id, { status: 'ignored' }); await loadAll({ silent: true }); toast('Correo ignorado'); }
+            catch { toast('No se pudo actualizar', 'err'); }
+          });
+        }
+        if (btn.dataset.act === 'inbox-complete') {
+          close();
+          setTimeout(() => txSheet(null, item), 220);
+        }
+      });
+    },
+    actions: [{ label: 'Cerrar', onClick: ({ close }) => close() }],
+  });
+}
+
+function auditSheet(tx) {
+  sheet({
+    title: 'Correo original',
+    body: html`
+      <p class="sheetText">Movimiento creado automáticamente a partir de esta alerta de Bancolombia.</p>
+      <pre class="finRawText">${tx.source_raw_text || 'Sin texto guardado.'}</pre>`,
+    actions: [{ label: 'Cerrar', onClick: ({ close }) => close() }],
+  });
 }
 
 /* ============================ vista: DEUDAS ============================ */
@@ -959,6 +1065,7 @@ function paint() {
         </div>
         <div class="finTopRight">
           <div class="finTopBtns">
+            ${state.inboxPending.length ? H`<button class="finBtn finBtn--plain finBtn--alert" type="button" data-act="inbox">📥 Bandeja (${state.inboxPending.length})</button>` : ''}
             <button class="finBtn finBtn--plain" type="button" data-act="tools">Exportar</button>
           </div>
           <small>✓ Sincronizado · PC + celular</small>
@@ -1197,16 +1304,17 @@ function spendTypeFor(type, categoryId, subcategoryId) {
   return 'variable';
 }
 
-function txSheet(tx) {
+function txSheet(tx, inboxItem) {
   const editing = !!tx;
+  const guess = inboxItem?.parsed;
   const data = {
-    type: tx?.type || 'expense',
-    amount: tx ? n(tx.amount) : '',
-    date: tx?.transaction_date || todayISO(),
+    type: tx?.type || guess?.type || 'expense',
+    amount: tx ? n(tx.amount) : (guess?.amount || ''),
+    date: tx?.transaction_date || (inboxItem ? dayOf(inboxItem.received_at) : todayISO()),
     category_id: tx?.category_id || '',
     subcategory_id: tx?.subcategory_id || '',
     goal_id: tx?.goal_id || state.goals[0]?.id || '',
-    description: tx?.description || '',
+    description: tx?.description || guess?.description || '',
     reimbursable: !!tx?.reimbursable,
     reimburse_by: tx?.reimburse_by || '',
   };
@@ -1220,9 +1328,11 @@ function txSheet(tx) {
   };
 
   sheet({
-    title: editing ? 'Editar movimiento' : 'Nuevo movimiento',
+    title: editing ? 'Editar movimiento' : (inboxItem ? 'Completar movimiento' : 'Nuevo movimiento'),
     body: html`
       <div class="finForm">
+        ${inboxItem ? H`<p class="sheetText">Del correo: <b>${inboxItem.subject || 'alerta de Bancolombia'}</b>.
+          Revisa los datos antes de guardar${!guess ? ' (no se reconoció el formato, complétalos a mano)' : ''}.</p>` : ''}
         <div class="finSeg" data-seg="type">
           <button type="button" data-v="expense" aria-pressed="${segType === 'expense'}">Gasto</button>
           <button type="button" data-v="income" aria-pressed="${segType === 'income'}">Ingreso</button>
@@ -1371,6 +1481,11 @@ function txSheet(tx) {
         // El momento del movimiento se fija al crearlo y no se toca al editar,
         // para no reescribir la hora real de algo registrado antes.
         if (!editing) payload.occurred_at = new Date().toISOString();
+        if (!editing && inboxItem) {
+          payload.source = 'automatico';
+          payload.source_message_id = inboxItem.gmail_message_id;
+          payload.source_raw_text = inboxItem.raw_text;
+        }
         try {
           if (editing) {
             await Finance.updateTransaction(tx.id, payload);
@@ -1380,8 +1495,11 @@ function txSheet(tx) {
               await applyGoal(payload.goal_id, goalDelta(payload));
             }
           } else {
-            await Finance.addTransaction(payload);
+            const created = await Finance.addTransaction(payload);
             await applyGoal(payload.goal_id, goalDelta(payload));
+            if (inboxItem) {
+              await Finance.updateInbox(inboxItem.id, { status: 'applied', transaction_id: created.id, profile_id: state.profileId });
+            }
           }
           close();
           await loadAll({ silent: true });
@@ -1719,6 +1837,7 @@ function wire() {
     if (act === 'wk-next') { state.weekOffset += 1; return paint(); }
     if (act === 'free-detail') return freeSheet();
     if (act === 'reconcile') return reconcileSheet();
+    if (act === 'inbox') return inboxSheet();
 
     if (act === 'base') {
       return simpleSheet({
@@ -1739,9 +1858,10 @@ function wire() {
 
     /* --- movimientos --- */
     if (act === 'tx-new') return txSheet(null);
-    if (act === 'tx-edit' || act === 'tx-del') {
+    if (act === 'tx-edit' || act === 'tx-del' || act === 'tx-audit') {
       const id = btn.closest('[data-tx]').dataset.tx;
       const tx = state.tx.find((t) => t.id === id);
+      if (act === 'tx-audit') return auditSheet(tx);
       if (act === 'tx-edit') return txSheet(tx);
       return confirmSheet('Eliminar movimiento', '¿Borrar este movimiento? No se puede deshacer.', async () => {
         try {
@@ -1835,6 +1955,19 @@ function wire() {
       });
     }
 
+    /* --- tarjetas/cuentas -> perfil (ingesta automática) --- */
+    if (act === 'card-new' || act === 'card-edit') {
+      const id = btn.closest('[data-card]')?.dataset.card;
+      return cardProfileSheet(state.cardProfiles.find((x) => x.id === id));
+    }
+    if (act === 'card-del') {
+      const id = btn.closest('[data-card]').dataset.card;
+      return confirmSheet('Eliminar mapeo', 'Las alertas de esa tarjeta/cuenta quedarán en la bandeja de revisión.', async () => {
+        try { await Finance.removeCardProfile(id); await loadAll({ silent: true }); toast('Mapeo eliminado'); }
+        catch { toast('No se pudo eliminar', 'err'); }
+      });
+    }
+
     /* --- deudas --- */
     if (act === 'debt-new' || act === 'debt-edit') {
       const id = btn.closest('[data-debt]')?.dataset.debt;
@@ -1902,7 +2035,8 @@ export async function render(container) {
   catch { if (!state.loaded) toast('Sin conexión: mostrando lo último guardado', 'err'); }
 
   watch('finance', ['finance_transactions', 'budgets', 'savings_goals', 'debts',
-    'finance_categories', 'finance_subcategories', 'profiles'],
+    'finance_categories', 'finance_subcategories', 'profiles',
+    'finance_card_profiles', 'finance_email_inbox'],
   () => loadAll({ silent: true }));
 }
 
