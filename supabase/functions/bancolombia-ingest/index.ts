@@ -16,6 +16,9 @@ const bogotaDateISO = (d: Date) => new Intl.DateTimeFormat('en-CA', {
   timeZone: 'America/Bogota', year: 'numeric', month: '2-digit', day: '2-digit',
 }).format(d);
 
+// Clave para emparejar reglas de comercio: mayusculas, espacios colapsados.
+const normMerchant = (s: string) => s.trim().toUpperCase().replace(/\s+/g, ' ');
+
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: cors });
   if (req.method !== 'POST') return json({ error: 'Metodo no soportado' }, 405);
@@ -43,9 +46,19 @@ Deno.serve(async (req: Request) => {
 
   const db = createClient(Deno.env.get('SUPABASE_URL') ?? '', Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '');
 
+  const parsed = parseBancolombiaAlert(rawText);
+  // Sin "$" en el correo no es una transaccion (extracto, aviso de seguridad,
+  // promocion...): se guarda para el antiduplicados pero nunca se muestra en
+  // la bandeja de revision.
+  const looksLikeTransaction = /\$\s*[0-9]/.test(rawText);
+  const initialStatus = looksLikeTransaction ? 'pending_review' : 'ignored';
+
   // Antiduplicados: el message id de Gmail es la clave unica de la bandeja.
   const { data: inboxRow, error: insertErr } = await db.from('finance_email_inbox')
-    .insert({ gmail_message_id: gmailMessageId, received_at: receivedDate.toISOString(), subject, raw_text: rawText })
+    .insert({
+      gmail_message_id: gmailMessageId, received_at: receivedDate.toISOString(), subject, raw_text: rawText,
+      status: initialStatus,
+    })
     .select().single();
 
   if (insertErr) {
@@ -54,7 +67,7 @@ Deno.serve(async (req: Request) => {
     return json({ error: 'No se pudo guardar el correo en la bandeja' }, 500);
   }
 
-  const parsed = parseBancolombiaAlert(rawText);
+  if (!looksLikeTransaction) return json({ ok: true, status: 'ignored', reason: 'sin_monto' });
 
   let profileId: string | null = null;
   if (parsed?.last4) {
@@ -74,23 +87,51 @@ Deno.serve(async (req: Request) => {
     return json({ ok: true, status: 'pending_review', reason: parsed ? 'tarjeta_no_mapeada' : 'formato_no_reconocido' });
   }
 
-  const { data: cat, error: catErr } = await db.from('finance_categories')
-    .select('id').eq('name', 'Varios / Ocasionales').limit(1).single();
-  if (catErr) console.error('lookup categoria Varios/Ocasionales failed', catErr);
+  const txDate = bogotaDateISO(receivedDate);
+
+  // Ya lo registraste a mano antes de que llegara el correo: no crear otro
+  // movimiento, solo enlazar el correo al que ya existe. Si hay mas de una
+  // coincidencia no se adivina cual es (podrian ser dos compras reales del
+  // mismo monto el mismo dia) y se sigue el flujo normal.
+  const { data: dupes, error: dupeErr } = await db.from('finance_transactions')
+    .select('id').eq('profile_id', profileId).eq('source', 'manual')
+    .eq('transaction_date', txDate).eq('type', parsed.type).eq('amount', parsed.amount);
+  if (dupeErr) console.error('lookup duplicate finance_transactions failed', dupeErr);
+  if (dupes && dupes.length === 1) {
+    const { error: linkErr } = await db.from('finance_email_inbox')
+      .update({ status: 'applied', parsed, profile_id: profileId, transaction_id: dupes[0].id })
+      .eq('id', inboxRow.id);
+    if (linkErr) console.error('link duplicate finance_email_inbox failed', linkErr);
+    return json({ ok: true, status: 'applied', duplicate_of_manual: dupes[0].id });
+  }
+
+  let catId: string | null = null;
   let subId: string | null = null;
-  if (cat?.id) {
-    const { data: sub } = await db.from('finance_subcategories')
-      .select('id').eq('category_id', cat.id).eq('name', 'Sin clasificar').limit(1).single();
-    subId = sub?.id ?? null;
+  if (parsed.description) {
+    const { data: rule } = await db.from('finance_merchant_rules')
+      .select('category_id, subcategory_id').eq('profile_id', profileId)
+      .eq('merchant_key', normMerchant(parsed.description)).maybeSingle();
+    if (rule) { catId = rule.category_id; subId = rule.subcategory_id; }
+  }
+  if (!catId) {
+    const { data: cat, error: catErr } = await db.from('finance_categories')
+      .select('id').eq('name', 'Varios / Ocasionales').limit(1).single();
+    if (catErr) console.error('lookup categoria Varios/Ocasionales failed', catErr);
+    catId = cat?.id ?? null;
+    if (catId) {
+      const { data: sub } = await db.from('finance_subcategories')
+        .select('id').eq('category_id', catId).eq('name', 'Sin clasificar').limit(1).single();
+      subId = sub?.id ?? null;
+    }
   }
 
   const { data: tx, error: txErr } = await db.from('finance_transactions').insert({
     profile_id: profileId,
     type: parsed.type,
     amount: parsed.amount,
-    transaction_date: bogotaDateISO(receivedDate),
+    transaction_date: txDate,
     occurred_at: receivedDate.toISOString(),
-    category_id: cat?.id ?? null,
+    category_id: catId,
     subcategory_id: subId,
     spend_type: parsed.type === 'income' ? 'income' : 'variable',
     description: parsed.description,

@@ -64,7 +64,7 @@ let state = {
   year: 0, month: 0,
   weekOffset: 0,
   profiles: [], cats: [], subs: [], tx: [], budgets: [], goals: [], debts: [],
-  cardProfiles: [], inboxPending: [],
+  cardProfiles: [], inboxPending: [], merchantRules: [],
   loaded: false,
 };
 
@@ -347,13 +347,13 @@ function hormigaTx(list) {
 /* ============================ carga ============================ */
 async function loadAll({ silent = false } = {}) {
   const pid = state.profileId;
-  const [profiles, cats, subs, tx, budgets, goals, debts, cardProfiles, inboxPending] = await Promise.all([
+  const [profiles, cats, subs, tx, budgets, goals, debts, cardProfiles, inboxPending, merchantRules] = await Promise.all([
     Finance.profiles(), Finance.categories(), Finance.subcategories(),
     Finance.allTransactions(pid), Finance.budgets(pid), Finance.goals(pid), Finance.debts(pid),
-    Finance.cardProfiles(), Finance.inboxPending(),
+    Finance.cardProfiles(), Finance.inboxPending(), Finance.merchantRules(pid),
   ]);
-  Object.assign(state, { profiles, cats, subs, tx, budgets, goals, debts, cardProfiles, inboxPending, loaded: true });
-  writeCache('fin:' + pid, { profiles, cats, subs, tx, budgets, goals, debts, cardProfiles, inboxPending });
+  Object.assign(state, { profiles, cats, subs, tx, budgets, goals, debts, cardProfiles, inboxPending, merchantRules, loaded: true });
+  writeCache('fin:' + pid, { profiles, cats, subs, tx, budgets, goals, debts, cardProfiles, inboxPending, merchantRules });
   aplicarAcento(profiles.find((x) => x.id === pid));
   if (!silent) toast('Finanzas al día');
   paint();
@@ -429,7 +429,8 @@ function rowHTML(t) {
       <div class="finRowText"><b>${title}</b><small>${meta}</small>${raw(chip)}</div>
       <div class="finRowAmt">${sign}${money(t.amount)}</div>
       <div class="finIcons">
-        ${auto ? H`<button type="button" data-act="tx-audit" aria-label="Ver correo original">🧾</button>` : ''}
+        ${auto ? H`<button type="button" data-act="tx-audit" aria-label="Ver correo original">🧾</button>
+        <button type="button" data-act="tx-rule" aria-label="Categorizar siempre así">🏷️</button>` : ''}
         <button type="button" data-act="tx-edit" aria-label="Editar">✎</button>
         <button type="button" data-act="tx-del" aria-label="Eliminar">✕</button>
       </div>
@@ -732,7 +733,78 @@ function viewAutomatizacion() {
         <button class="finBtn finBtn--sm" type="button" data-act="card-new">+ Tarjeta o cuenta</button>
       </div>
       ${state.cardProfiles.length ? raw(rows) : H`<div class="finEmpty">Sin tarjetas/cuentas mapeadas todavía: las alertas quedarán en la bandeja de revisión.</div>`}
+    </div>
+    ${raw(viewMerchantRules())}`;
+}
+
+function viewMerchantRules() {
+  const rows = state.merchantRules.map((r) => {
+    const cat = catById(r.category_id); const sub = subById(r.subcategory_id);
+    return html`
+      <div class="finLine" data-rule="${r.id}">
+        <span>🏷️ ${r.merchant_key} <small>${sub ? sub.emoji + ' ' + sub.name + ' · ' : ''}${cat?.emoji || ''} ${cat?.name || 'Sin categoría'}</small></span>
+        <span class="finIcons" style="flex:none">
+          <button type="button" data-act="rule-edit" aria-label="Editar">✎</button>
+          <button type="button" data-act="rule-del" aria-label="Eliminar">✕</button>
+        </span>
+      </div>`;
+  }).join('');
+  return html`
+    <div class="finPanel" style="margin-top:20px">
+      <div class="finPanelHead">
+        <div><span class="finTag finTag--lime">Ingesta automática</span><h2>Categoría automática por comercio</h2>
+        <p>Un comercio que se repite (Oxxo, Jerónimo Martins...) cae directo en esta categoría, sin pasar por la bandeja.</p></div>
+        <button class="finBtn finBtn--sm" type="button" data-act="rule-new">+ Regla</button>
+      </div>
+      ${state.merchantRules.length ? raw(rows) : H`<div class="finEmpty">Sin reglas todavía. Desde un movimiento automático puedes tocar 🏷️ "Categorizar siempre así".</div>`}
     </div>`;
+}
+
+function merchantRuleSheet(r, prefillMerchant) {
+  const catOpts = () => state.cats.filter((c) => c.kind === 'fixed' || c.kind === 'variable');
+  const data = {
+    merchant_key: r?.merchant_key || prefillMerchant || '',
+    category_id: r?.category_id || '',
+    subcategory_id: r?.subcategory_id || '',
+  };
+  sheet({
+    title: r ? 'Editar regla de comercio' : 'Nueva regla de comercio',
+    body: html`
+      <div class="finForm">
+        ${raw(field('Comercio (tal cual aparece en el correo)', `<input type="text" data-f="merchant_key" value="${esc(data.merchant_key)}" placeholder="OXXO">`))}
+        ${raw(field('Categoría', `<select data-f="category_id"><option value="">— elige —</option>${
+    optionList(catOpts(), data.category_id, (c) => ({ value: c.id, label: `${c.emoji || ''} ${c.name}` }))}</select>`))}
+        ${raw(field('Subcategoría (opcional)', '<select data-f="subcategory_id"><option value="">— toda la categoría —</option></select>'))}
+      </div>`,
+    onOpen: ({ root: rt, close }) => {
+      const get = (f) => $(`[data-f="${f}"]`, rt);
+      const paintSubs = () => {
+        const list = state.subs.filter((s) => s.category_id === get('category_id').value);
+        get('subcategory_id').innerHTML = '<option value="">— toda la categoría —</option>'
+          + optionList(list, data.subcategory_id, (s) => ({ value: s.id, label: `${s.emoji || ''} ${s.name}` }));
+      };
+      paintSubs();
+      get('category_id').addEventListener('change', () => { data.subcategory_id = ''; paintSubs(); });
+      rt.__save = async () => {
+        const merchant_key = get('merchant_key').value.trim().toUpperCase().replace(/\s+/g, ' ');
+        const category_id = get('category_id').value || null;
+        if (!merchant_key) return toast('Escribe el nombre del comercio', 'err');
+        if (!category_id) return toast('Elige una categoría', 'err');
+        const payload = { merchant_key, category_id, subcategory_id: get('subcategory_id').value || null };
+        try {
+          if (r) await Finance.updateMerchantRule(r.id, payload);
+          else await Finance.addMerchantRule({ ...payload, profile_id: state.profileId });
+          close();
+          await loadAll({ silent: true });
+          toast('Regla guardada');
+        } catch { toast('No se pudo guardar (¿ya existe una regla para ese comercio?)', 'err'); }
+      };
+    },
+    actions: [
+      { label: 'Cancelar', onClick: ({ close }) => close() },
+      { label: 'Guardar', variant: 'primary', onClick: ({ root: rt }) => rt.__save?.() },
+    ],
+  });
 }
 
 function cardProfileSheet(c) {
@@ -1968,6 +2040,26 @@ function wire() {
       });
     }
 
+    /* --- categoría automática por comercio --- */
+    if (act === 'rule-new' || act === 'rule-edit') {
+      const id = btn.closest('[data-rule]')?.dataset.rule;
+      return merchantRuleSheet(state.merchantRules.find((x) => x.id === id));
+    }
+    if (act === 'rule-del') {
+      const id = btn.closest('[data-rule]').dataset.rule;
+      return confirmSheet('Eliminar regla', 'Los próximos movimientos de ese comercio volverán a caer en Sin clasificar.', async () => {
+        try { await Finance.removeMerchantRule(id); await loadAll({ silent: true }); toast('Regla eliminada'); }
+        catch { toast('No se pudo eliminar', 'err'); }
+      });
+    }
+    if (act === 'tx-rule') {
+      const id = btn.closest('[data-tx]').dataset.tx;
+      const tx = state.tx.find((t) => t.id === id);
+      if (!tx) return;
+      const existing = state.merchantRules.find((r) => r.merchant_key === (tx.description || '').trim().toUpperCase().replace(/\s+/g, ' '));
+      return merchantRuleSheet(existing, tx.description);
+    }
+
     /* --- deudas --- */
     if (act === 'debt-new' || act === 'debt-edit') {
       const id = btn.closest('[data-debt]')?.dataset.debt;
@@ -2036,7 +2128,7 @@ export async function render(container) {
 
   watch('finance', ['finance_transactions', 'budgets', 'savings_goals', 'debts',
     'finance_categories', 'finance_subcategories', 'profiles',
-    'finance_card_profiles', 'finance_email_inbox'],
+    'finance_card_profiles', 'finance_email_inbox', 'finance_merchant_rules'],
   () => loadAll({ silent: true }));
 }
 

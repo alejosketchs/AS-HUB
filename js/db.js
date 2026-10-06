@@ -194,6 +194,14 @@ export const Finance = {
       .eq('status', 'pending_review').order('received_at', { ascending: false }));
   },
   async updateInbox(id, patch) { return unwrap(await sb.from('finance_email_inbox').update(patch).eq('id', id).select().single()); },
+
+  /* Reglas de categoría automática por comercio (ingesta automática). */
+  async merchantRules(profileId) {
+    return unwrap(await sb.from('finance_merchant_rules').select('*').eq('profile_id', profileId).order('created_at'));
+  },
+  async addMerchantRule(r) { return unwrap(await sb.from('finance_merchant_rules').insert(r).select().single()); },
+  async updateMerchantRule(id, patch) { return unwrap(await sb.from('finance_merchant_rules').update(patch).eq('id', id).select().single()); },
+  async removeMerchantRule(id) { return unwrap(await sb.from('finance_merchant_rules').delete().eq('id', id)); },
 };
 
 /* ---------- SESIÓN DEL SUITE ---------- */
