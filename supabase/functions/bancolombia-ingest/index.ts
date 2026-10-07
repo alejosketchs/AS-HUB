@@ -107,11 +107,12 @@ Deno.serve(async (req: Request) => {
 
   let catId: string | null = null;
   let subId: string | null = null;
+  let note: string | null = null;
   if (parsed.description) {
     const { data: rule } = await db.from('finance_merchant_rules')
-      .select('category_id, subcategory_id').eq('profile_id', profileId)
+      .select('category_id, subcategory_id, note').eq('profile_id', profileId)
       .eq('merchant_key', normMerchant(parsed.description)).maybeSingle();
-    if (rule) { catId = rule.category_id; subId = rule.subcategory_id; }
+    if (rule) { catId = rule.category_id; subId = rule.subcategory_id; note = rule.note; }
   }
   if (!catId) {
     const { data: cat, error: catErr } = await db.from('finance_categories')
@@ -134,7 +135,7 @@ Deno.serve(async (req: Request) => {
     category_id: catId,
     subcategory_id: subId,
     spend_type: parsed.type === 'income' ? 'income' : 'variable',
-    description: parsed.description,
+    description: note || parsed.description,
     source: 'automatico',
     source_message_id: gmailMessageId,
     source_raw_text: rawText,

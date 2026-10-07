@@ -742,7 +742,7 @@ function viewMerchantRules() {
     const cat = catById(r.category_id); const sub = subById(r.subcategory_id);
     return html`
       <div class="finLine" data-rule="${r.id}">
-        <span>🏷️ ${r.merchant_key} <small>${sub ? sub.emoji + ' ' + sub.name + ' · ' : ''}${cat?.emoji || ''} ${cat?.name || 'Sin categoría'}</small></span>
+        <span>🏷️ ${r.merchant_key}${r.note ? ' → "' + r.note + '"' : ''} <small>${sub ? sub.emoji + ' ' + sub.name + ' · ' : ''}${cat?.emoji || ''} ${cat?.name || 'Sin categoría'}</small></span>
         <span class="finIcons" style="flex:none">
           <button type="button" data-act="rule-edit" aria-label="Editar">✎</button>
           <button type="button" data-act="rule-del" aria-label="Eliminar">✕</button>
@@ -766,6 +766,7 @@ function merchantRuleSheet(r, prefillMerchant) {
     merchant_key: r?.merchant_key || prefillMerchant || '',
     category_id: r?.category_id || '',
     subcategory_id: r?.subcategory_id || '',
+    note: r?.note || '',
   };
   sheet({
     title: r ? 'Editar regla de comercio' : 'Nueva regla de comercio',
@@ -775,6 +776,7 @@ function merchantRuleSheet(r, prefillMerchant) {
         ${raw(field('Categoría', `<select data-f="category_id"><option value="">— elige —</option>${
     optionList(catOpts(), data.category_id, (c) => ({ value: c.id, label: `${c.emoji || ''} ${c.name}` }))}</select>`))}
         ${raw(field('Subcategoría (opcional)', '<select data-f="subcategory_id"><option value="">— toda la categoría —</option></select>'))}
+        ${raw(field('Nota (opcional, reemplaza el nombre del comercio en el movimiento)', `<input type="text" data-f="note" value="${esc(data.note)}" placeholder="Ej: Mercado del mes">`))}
       </div>`,
     onOpen: ({ root: rt, close }) => {
       const get = (f) => $(`[data-f="${f}"]`, rt);
@@ -790,7 +792,7 @@ function merchantRuleSheet(r, prefillMerchant) {
         const category_id = get('category_id').value || null;
         if (!merchant_key) return toast('Escribe el nombre del comercio', 'err');
         if (!category_id) return toast('Elige una categoría', 'err');
-        const payload = { merchant_key, category_id, subcategory_id: get('subcategory_id').value || null };
+        const payload = { merchant_key, category_id, subcategory_id: get('subcategory_id').value || null, note: get('note').value.trim() || null };
         try {
           if (r) await Finance.updateMerchantRule(r.id, payload);
           else await Finance.addMerchantRule({ ...payload, profile_id: state.profileId });
