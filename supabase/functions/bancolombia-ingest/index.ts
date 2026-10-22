@@ -1,5 +1,5 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
-import { isOwnCardPayment, looksLikeTransaction, parseBancolombiaAlert } from './parser.js';
+import { planNewAlert, planReplay } from './decide.js';
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -46,36 +46,40 @@ Deno.serve(async (req: Request) => {
 
   const db = createClient(Deno.env.get('SUPABASE_URL') ?? '', Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '');
 
-  // Pago de la tarjeta propia ("Abono a tarjeta de credito ... en Pesos/en
-  // Dolares"): no es ingreso. Se guarda el correo para el antiduplicados y
-  // queda ignored, fuera de la bandeja.
-  const ownCard = isOwnCardPayment(rawText);
-  const parsed = ownCard ? null : parseBancolombiaAlert(rawText);
-  // Sin monto ("$" o "COP") en el correo no es una transaccion (extracto,
-  // aviso de seguridad, promocion...): se guarda para el antiduplicados pero
-  // nunca se muestra en la bandeja de revision.
-  const isTransaction = !ownCard && looksLikeTransaction(rawText);
-  const initialStatus = isTransaction ? 'pending_review' : 'ignored';
+  const plan = planNewAlert(rawText);
+  // pending_review hasta saber si hay perfil; ignored si no es un movimiento
+  // o si es el pago de la tarjeta propia (no se crea gasto ni ingreso).
+  const initialStatus = plan.status === 'ignored' ? 'ignored' : 'pending_review';
 
   // Antiduplicados: el message id de Gmail es la clave unica de la bandeja.
+  // Si ya existe, no se crea movimiento: esa fila entra al aprobarla, o ya
+  // quedó applied. Nunca por las dos vías.
   const insertRow: Record<string, unknown> = {
     gmail_message_id: gmailMessageId, received_at: receivedDate.toISOString(), subject, raw_text: rawText,
     status: initialStatus,
   };
-  if (ownCard) insertRow.parsed = { ignored_reason: 'pago_tarjeta_propia' };
+  if (plan.reason === 'pago_tarjeta_propia') insertRow.parsed = { ignored_reason: 'pago_tarjeta_propia' };
 
   const { data: inboxRow, error: insertErr } = await db.from('finance_email_inbox')
     .insert(insertRow)
     .select().single();
 
   if (insertErr) {
-    if (insertErr.code === '23505') return json({ ok: true, duplicate: true });
+    if (insertErr.code === '23505') {
+      const { data: existing } = await db.from('finance_email_inbox')
+        .select('status').eq('gmail_message_id', gmailMessageId).maybeSingle();
+      const replay = planReplay(existing || { status: 'pending_review' });
+      return json({ ok: true, duplicate: true, status: replay.status, reason: replay.reason, createTransaction: false });
+    }
     console.error('insert finance_email_inbox failed', insertErr);
     return json({ error: 'No se pudo guardar el correo en la bandeja' }, 500);
   }
 
-  if (ownCard) return json({ ok: true, status: 'ignored', reason: 'pago_tarjeta_propia' });
-  if (!isTransaction) return json({ ok: true, status: 'ignored', reason: 'sin_monto' });
+  if (!plan.createTransaction) {
+    return json({ ok: true, status: plan.status, reason: plan.reason });
+  }
+
+  const parsed = plan.parsed;
 
   let profileId: string | null = null;
   if (parsed?.last4) {
@@ -111,6 +115,19 @@ Deno.serve(async (req: Request) => {
       .eq('id', inboxRow.id);
     if (linkErr) console.error('link duplicate finance_email_inbox failed', linkErr);
     return json({ ok: true, status: 'applied', duplicate_of_manual: dupes[0].id });
+  }
+
+  // Si este correo ya originó un movimiento (por ejemplo lo aprobaron en la
+  // bandeja), no se inserta otro: se enlaza la fila a ese.
+  const { data: already, error: alreadyErr } = await db.from('finance_transactions')
+    .select('id').eq('source_message_id', gmailMessageId).order('created_at').limit(1);
+  if (alreadyErr) console.error('lookup source_message_id failed', alreadyErr);
+  if (already && already.length) {
+    const { error: linkErr } = await db.from('finance_email_inbox')
+      .update({ status: 'applied', parsed, profile_id: profileId, transaction_id: already[0].id })
+      .eq('id', inboxRow.id);
+    if (linkErr) console.error('link existing finance_email_inbox failed', linkErr);
+    return json({ ok: true, status: 'applied', transaction_id: already[0].id, already: true });
   }
 
   let catId: string | null = null;

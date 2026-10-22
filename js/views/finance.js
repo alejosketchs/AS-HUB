@@ -7,7 +7,7 @@ import {
 import { TZ, ACCENTS, APP_VERSION } from '../config.js';
 import { perfilActivo, hashPin, cambiarPin, cerrarSesion } from '../session.js';
 import { bindCOPInput, formatCOPInput, parseCOP } from '../cop-input.js';
-import { isOwnCardPayment } from '../bancolombia-text.js';
+import { isCardSettlement } from '../bancolombia-text.js';
 import { findAutomaticTwins, findDuplicatePairs } from '../tx-dupes.js';
 
 /* ============================ constantes ============================ */
@@ -840,7 +840,7 @@ function cardProfileSheet(c) {
 /* ============================ bandeja de revisión ============================ */
 /** Pago de la tarjeta propia: no es un ingreso y no se aprueba en lote. */
 function inboxIsOwnCard(item) {
-  return isOwnCardPayment(item?.raw_text || '') || item?.parsed?.ignored_reason === 'pago_tarjeta_propia';
+  return isCardSettlement(item?.raw_text || '') || item?.parsed?.ignored_reason === 'pago_tarjeta_propia';
 }
 
 /** Qué le falta a una fila de la bandeja para poder aprobarse en lote (vacío = lista). */

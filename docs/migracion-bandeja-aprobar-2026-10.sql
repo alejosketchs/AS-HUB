@@ -1,13 +1,15 @@
 -- AS FINANZAS · aprobar la bandeja de Bancolombia (octubre 2026)
 --
 -- Este archivo NO se aplica solo. Hay que correrlo a mano en el SQL editor
--- de Supabase (proyecto Suite Personal, derzetuipyugmrjaxcyu), antes de usar
--- en la app los botones Completar y Aprobar todas.
+-- de Supabase (proyecto Suite Personal, derzetuipyugmrjaxcyu) ANTES de
+-- publicar la función bancolombia-ingest. Si la función sale primero, los
+-- correos nuevos caen en la bandeja y después ya no se crean solos.
 -- Se puede volver a correr: reemplaza las funciones y no borra filas.
 --
--- NO registra tarjetas en finance_card_profiles. Eso queda pendiente de que
--- Alejo lo decida. Sin ese mapeo, las alertas siguen cayendo en la bandeja
--- para aprobarlas a mano.
+-- También deja registradas las tarjetas de Alejo (paso 4), sin duplicarlas
+-- si ya existen. Con eso, las alertas nuevas de esas tarjetas entran solas.
+-- Las filas que YA están en la bandeja (pending_review) no se convierten en
+-- movimientos aquí: esas siguen entrando solo cuando se aprueban.
 --
 -- Los pares manual + automático (por ejemplo los del 28 y 29 de sep) NO se
 -- tocan aquí. El manual no tiene source_message_id; el automático sí. Esos
@@ -144,7 +146,11 @@ begin
        or coalesce(r.parsed->>'type', '') not in ('income', 'expense')
        or r.parsed->>'ignored_reason' = 'pago_tarjeta_propia'
        or v_text ~* 'para abonar a la deuda'
-       or v_text ~* 'abono a (tu |la )?tarjeta de cr[eé]dito' then
+       or v_text ~* 'abono a (tu |la )?tarjeta de cr[eé]dito'
+       or v_text ~* 'a tu tarjeta de cr[eé]dito'
+       or v_text ~* 'a la tarjeta de cr[eé]dito'
+       or v_text ~* 'pago de (tu |la )?tarjeta de cr[eé]dito'
+       or v_text ~* 'pago a (tu |la )?tarjeta de cr[eé]dito' then
       v_skipped := v_skipped || to_jsonb(r.id);
       continue;
     end if;
@@ -165,3 +171,36 @@ $$;
 
 grant execute on function finance_inbox_apply(uuid, jsonb) to anon, authenticated;
 grant execute on function finance_inbox_apply_batch(uuid[]) to anon, authenticated;
+
+-- 4. Tarjetas de Alejo. Si el par perfil + últimos 4 ya existe, no se inserta
+--    otra fila. No borra ni pisa una etiqueta que ya estuviera.
+do $cards$
+declare
+  v_dupes int;
+begin
+  select count(*) into v_dupes from (
+    select profile_id, last4
+    from finance_card_profiles
+    group by profile_id, last4
+    having count(*) > 1
+  ) d;
+  if v_dupes > 0 then
+    raise notice 'Hay % pares perfil+últimos 4 repetidos. No se creó el índice único de tarjetas y no se borró nada. El insert de abajo igual no agrega un par que ya exista.', v_dupes;
+  else
+    execute 'create unique index if not exists finance_card_profiles_profile_last4_uidx on finance_card_profiles (profile_id, last4)';
+    raise notice 'Índice único de tarjetas listo (o ya existía).';
+  end if;
+end
+$cards$;
+
+insert into finance_card_profiles (profile_id, last4, label, active)
+select v.profile_id, v.last4, v.label, true
+from (values
+  ('alejo', '5076', 'Tarjeta débito compras'),
+  ('alejo', '8213', 'Cuenta ahorros'),
+  ('alejo', '1887', 'T. crédito Mastercard')
+) as v(profile_id, last4, label)
+where not exists (
+  select 1 from finance_card_profiles c
+  where c.profile_id = v.profile_id and c.last4 = v.last4
+);

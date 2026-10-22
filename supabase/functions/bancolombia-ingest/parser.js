@@ -79,21 +79,32 @@ function extractCounterpart(text) {
  * monto (antes y despues), donde Bancolombia sí pone la direccion real de
  * una transferencia ("...desde tu cuenta...").
  */
-// Pago de la tarjeta propia desde ahorros. Dice "abono" pero no es un ingreso,
-// y las compras de esa tarjeta ya se registraron aparte. La ingesta lo deja
-// en ignored (no entra a la bandeja). Se mira el correo completo: la frase
-// a veces queda lejos del monto.
-const OWN_CARD_RE = /para abonar a la deuda|abono a (?:tu |la )?tarjeta de cr[eé]dito/i;
+// Pago de la tarjeta propia desde ahorros o desde otra cuenta. No es un gasto
+// nuevo: las compras de esa tarjeta ya se registraron. "Pagaste en NETFLIX
+// con tu tarjeta" sí es un gasto y NO entra aquí (el verbo no va pegado a
+// "tarjeta de crédito").
+// El pago de la deuda puede traer el monto en medio ("Pagaste $76.056 a tu
+// tarjeta de crédito"). No se salta la palabra "en": eso es un comercio
+// ("Pagaste $85.000 en NETFLIX con tu tarjeta") y sí es un gasto.
+const OWN_CARD_RE = /para abonar a la deuda|abono a (?:tu |la )?tarjeta de cr[eé]dito|(?:pag\w*|pago)\b(?:(?!\ben\b).){0,80}?\b(?:a |de )?(?:tu |la )?tarjeta de cr[eé]dito/i;
+
+function flat(rawText) {
+  return String(rawText || '').replace(/\s+/g, ' ');
+}
 
 export function isOwnCardPayment(rawText) {
-  const text = String(rawText || '').replace(/\s+/g, ' ');
-  return OWN_CARD_RE.test(text);
+  return OWN_CARD_RE.test(flat(rawText));
+}
+
+/** Abono o pago de la deuda de la tarjeta. No crea movimiento. */
+export function isCardSettlement(rawText) {
+  return isOwnCardPayment(rawText);
 }
 
 function classify(lead, around) {
   const t = lead.toLowerCase();
   const w = around.toLowerCase();
-  if (isOwnCardPayment(w)) return null;
+  if (isCardSettlement(w)) return null;
   if (/\bcompr\w*/.test(t)) return { kind: 'compra', type: 'expense', label: 'Compra con tarjeta' };
   if (/\bretir\w*/.test(t)) return { kind: 'retiro', type: 'expense', label: 'Retiro' };
   if (/\bpag(?:o|ue|aste|ando)\b/.test(t)) return { kind: 'pago', type: 'expense', label: 'Pago' };
@@ -127,7 +138,7 @@ export function looksLikeTransaction(rawText) {
 export function parseBancolombiaAlert(rawText) {
   const text = String(rawText || '').replace(/\s+/g, ' ').trim();
   if (!text) return null;
-  if (isOwnCardPayment(text)) return null;
+  if (isCardSettlement(text)) return null;
 
   const amtMatch = AMOUNT_RE.exec(text);
   if (!amtMatch) return null;

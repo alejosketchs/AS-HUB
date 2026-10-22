@@ -1,10 +1,17 @@
 // Mismo criterio que supabase/functions/bancolombia-ingest/parser.js
-// (isOwnCardPayment). La app lo usa para no aprobar, como si fueran ingresos,
-// los abonos a la tarjeta propia que ya quedaron en la bandeja.
+// (isCardSettlement). La app lo usa para no aprobar, como si fueran gastos
+// o ingresos, los abonos y pagos de la tarjeta propia que ya quedaron en la bandeja.
 
-const OWN_CARD_RE = /para abonar a la deuda|abono a (?:tu |la )?tarjeta de cr[eé]dito/i;
+const OWN_CARD_RE = /para abonar a la deuda|abono a (?:tu |la )?tarjeta de cr[eé]dito|(?:pag\w*|pago)\b(?:(?!\ben\b).){0,80}?\b(?:a |de )?(?:tu |la )?tarjeta de cr[eé]dito/i;
+
+function flat(rawText) {
+  return String(rawText || '').replace(/\s+/g, ' ');
+}
 
 export function isOwnCardPayment(rawText) {
-  const text = String(rawText || '').replace(/\s+/g, ' ');
-  return OWN_CARD_RE.test(text);
+  return OWN_CARD_RE.test(flat(rawText));
+}
+
+export function isCardSettlement(rawText) {
+  return isOwnCardPayment(rawText);
 }

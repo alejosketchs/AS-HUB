@@ -1,8 +1,8 @@
 // Ejecutar con: node --test supabase/functions/bancolombia-ingest/parser.test.js
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isOwnCardPayment, looksLikeTransaction, parseCOPAmount, parseBancolombiaAlert } from './parser.js';
-import { isOwnCardPayment as isOwnCardPaymentApp } from '../../../js/bancolombia-text.js';
+import { isCardSettlement, isOwnCardPayment, looksLikeTransaction, parseCOPAmount, parseBancolombiaAlert } from './parser.js';
+import { isCardSettlement as isCardSettlementApp, isOwnCardPayment as isOwnCardPaymentApp } from '../../../js/bancolombia-text.js';
 
 // El pie de pagina real de Bancolombia repite este aviso en TODOS sus
 // correos (compras, pagos, retiros, transferencias por igual). Si el parser
@@ -222,12 +222,16 @@ test('la app y el parser coinciden en qué es pago de tarjeta propia', () => {
   const samples = [
     'Abono a tu tarjeta de crédito en Pesos $10.000',
     'Abono a la tarjeta de crédito en Dólares',
-    'Compraste COP59.900 en CapCut',
+    'Pagaste $76.056,27 a tu tarjeta de crédito *1887',
+    'Pago a la tarjeta de crédito Mastercard *1887 por $10.000',
+    'Compraste COP59.900 en CapCut con tu T.Cred *1887',
+    'Pagaste $85.000 en NETFLIX con tu T.Cred *1887',
     'Te abonaron $120.000 en tu cuenta',
     '',
   ];
   for (const raw of samples) {
     assert.equal(isOwnCardPaymentApp(raw), isOwnCardPayment(raw));
+    assert.equal(isCardSettlementApp(raw), isCardSettlement(raw));
   }
 });
 
