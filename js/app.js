@@ -4,22 +4,9 @@ import { requireSession, perfilActivo } from './session.js';
 import { APP_VERSION } from './config.js';
 import { applyTheme, openUserSettings } from './user-settings.js';
 
-/* El módulo de Tareas es el archivo más pesado del proyecto y hoy vive en un
-   espejo. Se pide primero la copia local: cuando el repo esté completo en
-   GitHub, esa copia existirá y el espejo dejará de usarse sin tocar nada. */
-const ESPEJO = 'https://as-hub-mods-as24-b7b9.vercel.app/views/';
-
-async function vista(nombre) {
-  try {
-    return await import(`./views/${nombre}.js`);
-  } catch {
-    return import(/* @vite-ignore */ ESPEJO + nombre + '.js');
-  }
-}
-
 const routes = {
   '/': () => import('./views/hub.js'),
-  '/tareas': () => vista('tasks'),
+  '/tareas': () => import('./views/tasks.js'),
   '/finanzas': () => import('./views/finance.js'),
 };
 
