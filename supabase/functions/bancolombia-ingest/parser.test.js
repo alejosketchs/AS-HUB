@@ -1,7 +1,12 @@
 // Ejecutar con: node --test supabase/functions/bancolombia-ingest/parser.test.js
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isCardSettlement, isOwnCardPayment, looksLikeTransaction, parseCOPAmount, parseBancolombiaAlert } from './parser.js';
+import { readFileSync } from 'node:fs';
+import {
+  AMOUNT_SRC, batchSkipReasons, CARD_BLOCK_PATTERNS, cardBlockReason, CREDIT_CARD_LAST4,
+  isCardSettlement, isOwnCardPayment, looksLikeTransaction, parseCOPAmount, parseBancolombiaAlert,
+  WINDOW_AFTER, WINDOW_BEFORE,
+} from './parser.js';
 import { isCardSettlement as isCardSettlementApp, isOwnCardPayment as isOwnCardPaymentApp } from '../../../js/bancolombia-text.js';
 
 // El pie de pagina real de Bancolombia repite este aviso en TODOS sus
@@ -195,27 +200,25 @@ test('looksLikeTransaction reconoce "$" y "COP"', () => {
   assert.equal(looksLikeTransaction('Llego tu extracto del mes'), false);
 });
 
-test('abono a tarjeta de credito desde ahorros NO es ingreso', () => {
+test('abono a tarjeta de credito desde ahorros NO es un gasto nuevo', () => {
   for (const moneda of ['Pesos', 'Dólares']) {
     const raw = `Bancolombia: Debitamos de tu cuenta/bolsillo $76,056.27 para abonar a la deuda en en ${moneda}. `
       + 'de tu tarjeta de credito MASTER **1887. Encontraras el abono el proximo dia habil.' + FOOTER;
     assert.equal(isOwnCardPayment(raw), true);
-    assert.equal(parseBancolombiaAlert(raw), null);
+    const parsed = parseBancolombiaAlert(raw);
+    assert.equal(parsed?.last4, '1887');
+    assert.equal(parsed?.type, 'income');
+    assert.equal(cardBlockReason(raw, parsed), 'ingreso_tarjeta_credito');
   }
 });
 
-test('Abono a tarjeta de credito en Pesos o en Dolares es pago propio, aunque la frase quede lejos del monto', () => {
+test('una frase de abono lejos del monto no se lee en el pie ni fuera de la ventana', () => {
   const pesos = 'Bancolombia te informa: Abono a tarjeta de crédito Mastercard **1887 en Pesos. '
     + 'Se debitó de tu cuenta de ahorros. El detalle del movimiento, que verás reflejado '
     + 'el siguiente día hábil en el cupo, corresponde a un valor de $76.056,27 el 21/10/2026 a las 08:12.'
     + FOOTER;
-  const dolares = 'Abono a tarjeta de credito Mastercard **1887 en Dólares\n'
-    + 'por $8.953,44 el 21/10/2026 a las 08:14. El abono se verá el próximo día hábil.' + FOOTER;
-  for (const raw of [pesos, dolares]) {
-    assert.equal(isOwnCardPayment(raw), true);
-    assert.equal(isOwnCardPaymentApp(raw), true);
-    assert.equal(parseBancolombiaAlert(raw), null);
-  }
+  assert.equal(isOwnCardPayment(pesos), false);
+  assert.equal(isCardSettlement(pesos), false);
 });
 
 test('la app y el parser coinciden en qué es pago de tarjeta propia', () => {
@@ -233,6 +236,84 @@ test('la app y el parser coinciden en qué es pago de tarjeta propia', () => {
     assert.equal(isOwnCardPaymentApp(raw), isOwnCardPayment(raw));
     assert.equal(isCardSettlementApp(raw), isCardSettlement(raw));
   }
+});
+
+test('el pie con "tarjeta de crédito" no convierte una compra en pago de la tarjeta', () => {
+  const cerca = ' Protege tu tarjeta de crédito. No la prestes.';
+  const lejos = ' Texto de relleno del aviso legal.'.repeat(30)
+    + ' Si vas a tu tarjeta de crédito para abonar, revisa el cupo.';
+  const raw = 'Bancolombia: Compraste $7.500,00 en CAFE EL AROMA con tu T.Deb *1234, el 29/09/2026 a las 19:06.'
+    + cerca + lejos;
+  assert.equal(isCardSettlement(raw), false);
+  assert.equal(isCardSettlementApp(raw), false);
+  assert.equal(cardBlockReason(raw, null), null);
+  const r = parseBancolombiaAlert(raw);
+  assert.ok(r);
+  assert.equal(r.kind, 'compra');
+  assert.equal(r.amount, 7500);
+  assert.equal(r.last4, '1234');
+});
+
+test('Abono a tu T.Cred *1887 se reconoce como ingreso de esa tarjeta', () => {
+  const raw = 'Bancolombia: Abono a tu T.Cred *1887 por $76.056,27 el 21/10/2026 a las 08:12.' + FOOTER;
+  const r = parseBancolombiaAlert(raw);
+  assert.ok(r);
+  assert.equal(r.type, 'income');
+  assert.equal(r.last4, '1887');
+  assert.equal(r.amount, 76056.27);
+  assert.equal(isCardSettlement(raw), false);
+  assert.equal(cardBlockReason(raw, r), 'ingreso_tarjeta_credito');
+});
+
+test('Pagaste a tu T.Cred *1887 desde la cuenta *8213 no es un gasto', () => {
+  const raw = 'Bancolombia: Pagaste $76.056,27 a tu T.Cred *1887 desde tu cuenta *8213 el 21/10/2026 a las 08:20.' + FOOTER;
+  const r = parseBancolombiaAlert(raw);
+  assert.ok(r);
+  assert.equal(r.type, 'expense');
+  assert.equal(cardBlockReason(raw, r), 'pago_desde_8213');
+  assert.equal(isCardSettlement(raw), false);
+});
+
+test('reverso en la 1887 es un ingreso y no una compra', () => {
+  const raw = 'Bancolombia: Reverso de compra por $40.000 en tu T.Cred *1887 el 21/10/2026 a las 10:00.' + FOOTER;
+  const r = parseBancolombiaAlert(raw);
+  assert.ok(r);
+  assert.equal(r.type, 'income');
+  assert.equal(r.kind, 'reverso');
+  assert.equal(r.last4, '1887');
+  assert.equal(r.amount, 40000);
+  assert.equal(cardBlockReason(raw, r), 'ingreso_tarjeta_credito');
+});
+
+test('Aprobar todas usa los mismos patrones, la misma ventana y los mismos campos', () => {
+  const sql = readFileSync(new URL('../../../docs/migracion-bandeja-aprobar-2026-10.sql', import.meta.url), 'utf8');
+  const found = [...sql.matchAll(/~\*\s*'([^']*)'/g)].map((m) => m[1]);
+  assert.deepEqual(found, CARD_BLOCK_PATTERNS.map((p) => p.source));
+  assert.ok(sql.includes(AMOUNT_SRC));
+  assert.match(sql, new RegExp(`v_at - ${WINDOW_BEFORE}`));
+  assert.match(sql, new RegExp(`v_at \\+ ${WINDOW_AFTER}`));
+  assert.match(sql, /r\.profile_id is null/);
+  assert.match(sql, /coalesce\(\(r\.parsed->>'amount'\)::numeric, 0\) <= 0/);
+  assert.match(sql, /nullif\(r\.parsed->>'category_id', ''\) is null/);
+  assert.match(sql, /not in \('income', 'expense'\)/);
+  assert.match(sql, new RegExp(`parsed->>'last4', ''\\) = '${CREDIT_CARD_LAST4}'`));
+  assert.match(sql, /parsed->>'type', ''\) = 'income'/);
+  const listo = {
+    status: 'pending_review', profile_id: 'alejo',
+    raw_text: 'Compraste $10.000 en TIENDA con tu T.Deb *5076',
+    parsed: { amount: 10000, category_id: 'cat', type: 'expense', last4: '5076' },
+  };
+  assert.deepEqual(batchSkipReasons(listo), []);
+  assert.ok(batchSkipReasons({ ...listo, profile_id: null }).includes('perfil'));
+  assert.ok(batchSkipReasons({ ...listo, parsed: { ...listo.parsed, amount: 0 } }).includes('monto'));
+  assert.ok(batchSkipReasons({ ...listo, parsed: { ...listo.parsed, category_id: '' } }).includes('categoría'));
+  assert.ok(batchSkipReasons({ ...listo, parsed: { ...listo.parsed, type: 'saving' } }).includes('tipo'));
+  const abono = {
+    ...listo,
+    raw_text: 'Abono a tu T.Cred *1887 por $10.000',
+    parsed: { amount: 10000, category_id: 'cat', type: 'income', last4: '1887' },
+  };
+  assert.ok(batchSkipReasons(abono).includes('ingreso_tarjeta_credito'));
 });
 
 test('un abono que no es pago de la tarjeta propia sigue pudiendo ser ingreso', () => {

@@ -3,7 +3,7 @@
 // una sola vía. Si la fila ya existe (aunque siga en pending_review), no se
 // crea el movimiento aquí; lo crea quien apruebe esa fila, o ya existe.
 
-import { isCardSettlement, looksLikeTransaction, parseBancolombiaAlert } from './parser.js';
+import { cardBlockReason, looksLikeTransaction, parseBancolombiaAlert } from './parser.js';
 
 /**
  * Reentrega de un correo que ya está en finance_email_inbox.
@@ -20,20 +20,40 @@ export function planReplay(existingInbox) {
 }
 
 /**
+ * Entre los manuales del mismo perfil, monto, día y tipo, el que todavía
+ * no está enlazado a otro correo. Si queda exactamente uno, es el gemelo.
+ * Cero, o dos o más libres: no se adivina. Dos compras iguales el mismo día
+ * no se funden en un solo movimiento.
+ */
+export function pickManualTwin(manuals, linkedIds) {
+  const linked = new Set((linkedIds || []).filter(Boolean));
+  const free = (manuals || []).filter((m) => m?.id && !linked.has(m.id));
+  return free.length === 1 ? free[0] : null;
+}
+
+/**
  * Correo nuevo (aún no está en la bandeja).
  * createTransaction solo significa "puede crearse si la tarjeta tiene un
- * único perfil". Un abono o pago de la tarjeta de crédito nunca puede.
+ * único perfil". Un ingreso de la 1887, o un pago desde la 8213 hacia esa
+ * tarjeta, no se crea solo: queda en pending_review. Ante duda, también.
+ * Solo se ignora un correo que ni siquiera trae monto.
  */
 export function planNewAlert(rawText) {
-  if (isCardSettlement(rawText)) {
-    return { createTransaction: false, status: 'ignored', reason: 'pago_tarjeta_propia', parsed: null };
-  }
   const parsed = parseBancolombiaAlert(rawText);
+  const block = cardBlockReason(rawText, parsed);
   if (!parsed) {
     if (!looksLikeTransaction(rawText)) {
       return { createTransaction: false, status: 'ignored', reason: 'sin_monto', parsed: null };
     }
-    return { createTransaction: false, status: 'pending_review', reason: 'formato_no_reconocido', parsed: null };
+    return {
+      createTransaction: false,
+      status: 'pending_review',
+      reason: block || 'formato_no_reconocido',
+      parsed: null,
+    };
+  }
+  if (block) {
+    return { createTransaction: false, status: 'pending_review', reason: block, parsed };
   }
   return { createTransaction: true, status: 'pending_review', reason: 'listo_si_hay_perfil', parsed };
 }

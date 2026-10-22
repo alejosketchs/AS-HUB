@@ -7,7 +7,7 @@ import {
 import { TZ, ACCENTS, APP_VERSION } from '../config.js';
 import { perfilActivo, hashPin, cambiarPin, cerrarSesion } from '../session.js';
 import { bindCOPInput, formatCOPInput, parseCOP } from '../cop-input.js';
-import { isCardSettlement } from '../bancolombia-text.js';
+import { batchSkipReasons } from '../bancolombia-text.js';
 import { findAutomaticTwins, findDuplicatePairs } from '../tx-dupes.js';
 
 /* ============================ constantes ============================ */
@@ -838,39 +838,43 @@ function cardProfileSheet(c) {
 }
 
 /* ============================ bandeja de revisión ============================ */
-/** Pago de la tarjeta propia: no es un ingreso y no se aprueba en lote. */
-function inboxIsOwnCard(item) {
-  return isCardSettlement(item?.raw_text || '') || item?.parsed?.ignored_reason === 'pago_tarjeta_propia';
+const INBOX_GAP_LABEL = {
+  perfil: 'perfil',
+  monto: 'monto',
+  categoría: 'categoría',
+  tipo: 'tipo',
+  pago_tarjeta_propia: 'pago de tu tarjeta (no entra solo)',
+  ingreso_tarjeta_credito: 'ingreso de la tarjeta de crédito (no entra solo)',
+  pago_desde_8213: 'pago desde ahorros a la tarjeta (no entra solo)',
+};
+const INBOX_BLOCKS = new Set(['pago_tarjeta_propia', 'ingreso_tarjeta_credito', 'pago_desde_8213']);
+
+function inboxCodes(item) {
+  return batchSkipReasons(item).filter((k) => k !== 'estado');
 }
 
-/** Qué le falta a una fila de la bandeja para poder aprobarse en lote (vacío = lista). */
+/** Qué le falta a una fila, o por qué no entra en "Aprobar todas" (vacío = lista). */
 function inboxMissing(item) {
-  if (inboxIsOwnCard(item)) return ['pago de tu tarjeta (no es un ingreso)'];
-  const p = item.parsed;
-  const missing = [];
-  if (!item.profile_id) missing.push('perfil');
-  if (!(n(p?.amount) > 0)) missing.push('monto');
-  if (!p?.category_id) missing.push('categoría');
-  if (p && !['income', 'expense'].includes(p.type)) missing.push('tipo');
-  return missing;
+  return inboxCodes(item).map((k) => INBOX_GAP_LABEL[k] || k);
 }
 
 function inboxItemHTML(item) {
   const p = item.parsed;
-  const ownCard = inboxIsOwnCard(item);
-  const guess = ownCard
-    ? 'Pago de tu propia tarjeta. No es un ingreso: ignóralo.'
+  const codes = inboxCodes(item);
+  const blocked = codes.some((k) => INBOX_BLOCKS.has(k));
+  const missing = codes.filter((k) => !INBOX_BLOCKS.has(k)).map((k) => INBOX_GAP_LABEL[k] || k);
+  const guess = blocked
+    ? `No entra solo${p?.amount ? `: ${p.type === 'income' ? '+' : '−'} ${money(p.amount)}${p.description ? ' · ' + p.description : ''}` : ''}. Revísalo y, si corresponde, complétalo a mano.`
     : (p ? `${p.type === 'income' ? '+' : '−'} ${money(p.amount)} · ${p.description}${p.last4 ? ' · ••••' + p.last4 : ''}`
       : 'No se reconoció el formato del correo');
-  const cat = !ownCard && p?.category_name ? ` · ${p.category_name}${p.subcategory_name ? ' › ' + p.subcategory_name : ''}` : '';
-  const missing = inboxMissing(item).filter((m) => !ownCard);
+  const cat = p?.category_name ? ` · ${p.category_name}${p.subcategory_name ? ' › ' + p.subcategory_name : ''}` : '';
   return html`
-    <div class="finLine ${missing.length || ownCard ? 'is-incomplete' : ''}" data-inbox="${item.id}" style="flex-wrap:wrap">
+    <div class="finLine ${codes.length ? 'is-incomplete' : ''}" data-inbox="${item.id}" style="flex-wrap:wrap">
       <span><b>${item.subject || 'Correo de Bancolombia'}</b><small>${timeOf(item.received_at) ? dateAt(dayOf(item.received_at)).toLocaleDateString('es-CO') + ' · ' : ''}${guess}${cat}</small>
         ${missing.length ? H`<small class="finMissing">Falta: ${missing.join(', ')}</small>` : ''}</span>
       <span class="finIcons" style="flex:none">
-        ${ownCard ? '' : H`<button class="finBtn finBtn--sm" type="button" data-act="inbox-complete">Completar</button>`}
-        <button class="finBtn finBtn--sm ${ownCard ? '' : 'finBtn--plain'}" type="button" data-act="inbox-ignore">Ignorar</button>
+        <button class="finBtn finBtn--sm" type="button" data-act="inbox-complete">Completar</button>
+        <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act="inbox-ignore">Ignorar</button>
       </span>
     </div>`;
 }

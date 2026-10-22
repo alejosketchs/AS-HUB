@@ -1,17 +1,15 @@
-// Mismo criterio que supabase/functions/bancolombia-ingest/parser.js
-// (isCardSettlement). La app lo usa para no aprobar, como si fueran gastos
-// o ingresos, los abonos y pagos de la tarjeta propia que ya quedaron en la bandeja.
-
-const OWN_CARD_RE = /para abonar a la deuda|abono a (?:tu |la )?tarjeta de cr[eé]dito|(?:pag\w*|pago)\b(?:(?!\ben\b).){0,80}?\b(?:a |de )?(?:tu |la )?tarjeta de cr[eé]dito/i;
-
-function flat(rawText) {
-  return String(rawText || '').replace(/\s+/g, ' ');
-}
-
-export function isOwnCardPayment(rawText) {
-  return OWN_CARD_RE.test(flat(rawText));
-}
-
-export function isCardSettlement(rawText) {
-  return isOwnCardPayment(rawText);
-}
+// La regla vive en el parser de la función (una sola copia).
+// La bandeja la usa para no meter en "Aprobar todas" un abono de la 1887
+// ni un pago desde la 8213 hacia esa tarjeta.
+export {
+  alertWindow,
+  batchSkipReasons,
+  CARD_BLOCK_PATTERNS,
+  cardBlockReason,
+  CREDIT_CARD_LAST4,
+  isCardSettlement,
+  isOwnCardPayment,
+  SAVINGS_LAST4,
+  WINDOW_AFTER,
+  WINDOW_BEFORE,
+} from '../supabase/functions/bancolombia-ingest/parser.js';

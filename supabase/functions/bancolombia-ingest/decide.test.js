@@ -1,7 +1,7 @@
 // Ejecutar con: node --test supabase/functions/bancolombia-ingest/decide.test.js
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { planNewAlert, planReplay } from './decide.js';
+import { pickManualTwin, planNewAlert, planReplay } from './decide.js';
 
 const FOOTER = ' Cuando compres, no pierdas de vista tu tarjeta.';
 
@@ -24,19 +24,18 @@ test('la 1887: un gasto en un comercio con esa tarjeta también cuenta', () => {
   assert.equal(plan.parsed.amount, 85000);
 });
 
-test('la 1887: el abono a la tarjeta no crea movimiento', () => {
+test('la 1887: el abono a la tarjeta no se crea solo y queda para revisar', () => {
   for (const moneda of ['Pesos', 'Dólares']) {
     const raw = `Bancolombia: Abono a tarjeta de crédito Mastercard **1887 en ${moneda}. `
       + 'Valor $76.056,27 el 21/10/2026.' + FOOTER;
     const plan = planNewAlert(raw);
     assert.equal(plan.createTransaction, false);
-    assert.equal(plan.status, 'ignored');
-    assert.equal(plan.reason, 'pago_tarjeta_propia');
-    assert.equal(plan.parsed, null);
+    assert.equal(plan.status, 'pending_review');
+    assert.notEqual(plan.status, 'ignored');
   }
 });
 
-test('la 1887: pagar la tarjeta (aunque el monto vaya en medio) no crea movimiento', () => {
+test('la 1887: pagar la tarjeta (aunque el monto vaya en medio) no se crea solo', () => {
   const samples = [
     'Bancolombia: Pagaste $76.056,27 a tu tarjeta de crédito Mastercard **1887 el 21/10/2026.' + FOOTER,
     'Bancolombia: Pago a la tarjeta de crédito *1887 por $8.953,44 en Dólares.' + FOOTER,
@@ -45,9 +44,59 @@ test('la 1887: pagar la tarjeta (aunque el monto vaya en medio) no crea movimien
   for (const raw of samples) {
     const plan = planNewAlert(raw);
     assert.equal(plan.createTransaction, false, raw);
-    assert.equal(plan.status, 'ignored');
-    assert.equal(plan.reason, 'pago_tarjeta_propia');
+    assert.equal(plan.status, 'pending_review', raw);
   }
+});
+
+test('Abono a tu T.Cred *1887 queda en revisión, no se crea solo', () => {
+  const raw = 'Bancolombia: Abono a tu T.Cred *1887 por $76.056,27 el 21/10/2026 a las 08:12.' + FOOTER;
+  const plan = planNewAlert(raw);
+  assert.equal(plan.createTransaction, false);
+  assert.equal(plan.status, 'pending_review');
+  assert.equal(plan.reason, 'ingreso_tarjeta_credito');
+  assert.equal(plan.parsed.type, 'income');
+  assert.equal(plan.parsed.last4, '1887');
+});
+
+test('Pagaste a tu T.Cred *1887 desde la cuenta *8213 no se crea como gasto', () => {
+  const raw = 'Bancolombia: Pagaste $76.056,27 a tu T.Cred *1887 desde tu cuenta *8213 el 21/10/2026 a las 08:20.' + FOOTER;
+  const plan = planNewAlert(raw);
+  assert.equal(plan.createTransaction, false);
+  assert.equal(plan.status, 'pending_review');
+  assert.equal(plan.reason, 'pago_desde_8213');
+  assert.equal(plan.parsed.type, 'expense');
+  assert.equal(plan.parsed.amount, 76056.27);
+});
+
+test('un reverso en la 1887 no se crea solo', () => {
+  const raw = 'Bancolombia: Reverso de compra por $40.000 en tu T.Cred *1887 el 21/10/2026 a las 10:00.' + FOOTER;
+  const plan = planNewAlert(raw);
+  assert.equal(plan.createTransaction, false);
+  assert.equal(plan.status, 'pending_review');
+  assert.equal(plan.reason, 'ingreso_tarjeta_credito');
+  assert.equal(plan.parsed.kind, 'reverso');
+});
+
+test('el pie con "tarjeta de crédito" no frena una compra real', () => {
+  const raw = 'Bancolombia: Compraste $12.900 en TIENDA LA ESQUINA con tu T.Deb *5076 el 21/10/2026 a las 16:39.'
+    + ' Protege tu tarjeta de crédito.'
+    + ' Aviso.'.repeat(80)
+    + ' Pasa a tu tarjeta de crédito para abonar cuando quieras.';
+  const plan = planNewAlert(raw);
+  assert.equal(plan.createTransaction, true);
+  assert.equal(plan.parsed.kind, 'compra');
+  assert.equal(plan.parsed.last4, '5076');
+});
+
+test('dos compras iguales el mismo día no se enlazan al manual que ya tiene correo', () => {
+  const a = { id: 'man-a' };
+  const b = { id: 'man-b' };
+  assert.equal(pickManualTwin([a, b], []), null);
+  assert.equal(pickManualTwin([a, b], ['man-a']).id, 'man-b');
+  assert.equal(pickManualTwin([a, b], ['man-a', 'man-b']), null);
+  assert.equal(pickManualTwin([a], ['man-a']), null);
+  assert.equal(pickManualTwin([a], []).id, 'man-a');
+  assert.equal(pickManualTwin([], []), null);
 });
 
 test('un correo que ya está en la bandeja no se crea otra vez, ni automático ni al reenviarlo', () => {

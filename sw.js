@@ -18,6 +18,7 @@ const SHELL = [
   '/js/user-settings.js',
   '/js/cop-input.js',
   '/js/bancolombia-text.js',
+  '/supabase/functions/bancolombia-ingest/parser.js',
   '/js/tx-dupes.js',
   '/js/views/hub.js',
   '/js/views/tasks.js',
