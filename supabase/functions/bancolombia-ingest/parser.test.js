@@ -1,7 +1,8 @@
 // Ejecutar con: node --test supabase/functions/bancolombia-ingest/parser.test.js
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { looksLikeTransaction, parseCOPAmount, parseBancolombiaAlert } from './parser.js';
+import { isOwnCardPayment, looksLikeTransaction, parseCOPAmount, parseBancolombiaAlert } from './parser.js';
+import { isOwnCardPayment as isOwnCardPaymentApp } from '../../../js/bancolombia-text.js';
 
 // El pie de pagina real de Bancolombia repite este aviso en TODOS sus
 // correos (compras, pagos, retiros, transferencias por igual). Si el parser
@@ -170,6 +171,24 @@ test('compra con monto en formato COP (tarjeta de credito)', () => {
   assert.equal(r.description, 'CapCut');
 });
 
+test('COP59.900 y COP23.500 sin decimales (el monto va pegado al codigo)', () => {
+  const capcut = parseBancolombiaAlert(
+    'Bancolombia: Compraste COP59.900 en CapCut con tu T.Cred *1887, el 13/10/2026 a las 19:58.' + FOOTER,
+  );
+  assert.ok(capcut);
+  assert.equal(capcut.amount, 59900);
+  assert.equal(capcut.last4, '1887');
+  assert.equal(capcut.description, 'CapCut');
+
+  const paramount = parseBancolombiaAlert(
+    'Bancolombia: Compraste COP23.500 en PARAMOUNT+ con tu T.Cred *1887, el 07/10/2026 a las 21:02.' + FOOTER,
+  );
+  assert.ok(paramount);
+  assert.equal(paramount.type, 'expense');
+  assert.equal(paramount.amount, 23500);
+  assert.equal(paramount.last4, '1887');
+});
+
 test('looksLikeTransaction reconoce "$" y "COP"', () => {
   assert.equal(looksLikeTransaction('Compraste COP23.500,00 en PARAMOUNT+'), true);
   assert.equal(looksLikeTransaction('Compraste $23.500 en PARAMOUNT+'), true);
@@ -178,10 +197,47 @@ test('looksLikeTransaction reconoce "$" y "COP"', () => {
 
 test('abono a tarjeta de credito desde ahorros NO es ingreso', () => {
   for (const moneda of ['Pesos', 'Dólares']) {
-    const r = parseBancolombiaAlert(
-      `Bancolombia: Debitamos de tu cuenta/bolsillo $76,056.27 para abonar a la deuda en en ${moneda}. `
-      + 'de tu tarjeta de credito MASTER **1887. Encontraras el abono el proximo dia habil.' + FOOTER,
-    );
-    assert.equal(r, null);
+    const raw = `Bancolombia: Debitamos de tu cuenta/bolsillo $76,056.27 para abonar a la deuda en en ${moneda}. `
+      + 'de tu tarjeta de credito MASTER **1887. Encontraras el abono el proximo dia habil.' + FOOTER;
+    assert.equal(isOwnCardPayment(raw), true);
+    assert.equal(parseBancolombiaAlert(raw), null);
   }
+});
+
+test('Abono a tarjeta de credito en Pesos o en Dolares es pago propio, aunque la frase quede lejos del monto', () => {
+  const pesos = 'Bancolombia te informa: Abono a tarjeta de crédito Mastercard **1887 en Pesos. '
+    + 'Se debitó de tu cuenta de ahorros. El detalle del movimiento, que verás reflejado '
+    + 'el siguiente día hábil en el cupo, corresponde a un valor de $76.056,27 el 21/10/2026 a las 08:12.'
+    + FOOTER;
+  const dolares = 'Abono a tarjeta de credito Mastercard **1887 en Dólares\n'
+    + 'por $8.953,44 el 21/10/2026 a las 08:14. El abono se verá el próximo día hábil.' + FOOTER;
+  for (const raw of [pesos, dolares]) {
+    assert.equal(isOwnCardPayment(raw), true);
+    assert.equal(isOwnCardPaymentApp(raw), true);
+    assert.equal(parseBancolombiaAlert(raw), null);
+  }
+});
+
+test('la app y el parser coinciden en qué es pago de tarjeta propia', () => {
+  const samples = [
+    'Abono a tu tarjeta de crédito en Pesos $10.000',
+    'Abono a la tarjeta de crédito en Dólares',
+    'Compraste COP59.900 en CapCut',
+    'Te abonaron $120.000 en tu cuenta',
+    '',
+  ];
+  for (const raw of samples) {
+    assert.equal(isOwnCardPaymentApp(raw), isOwnCardPayment(raw));
+  }
+});
+
+test('un abono que no es pago de la tarjeta propia sigue pudiendo ser ingreso', () => {
+  assert.equal(isOwnCardPayment('Te abonaron $120.000 en tu cuenta'), false);
+  const r = parseBancolombiaAlert(
+    'Bancolombia le informa que ha recibido una Transferencia por $120.000 en su cuenta *4567 '
+    + 'el 21/10/2026 a las 11:00 de MARIA GOMEZ. Te abonaron.' + FOOTER,
+  );
+  assert.ok(r);
+  assert.equal(r.type, 'income');
+  assert.equal(r.amount, 120000);
 });

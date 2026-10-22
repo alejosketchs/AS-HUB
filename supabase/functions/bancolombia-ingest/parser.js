@@ -79,13 +79,21 @@ function extractCounterpart(text) {
  * monto (antes y despues), donde Bancolombia sí pone la direccion real de
  * una transferencia ("...desde tu cuenta...").
  */
+// Pago de la tarjeta propia desde ahorros. Dice "abono" pero no es un ingreso,
+// y las compras de esa tarjeta ya se registraron aparte. La ingesta lo deja
+// en ignored (no entra a la bandeja). Se mira el correo completo: la frase
+// a veces queda lejos del monto.
+const OWN_CARD_RE = /para abonar a la deuda|abono a (?:tu |la )?tarjeta de cr[eé]dito/i;
+
+export function isOwnCardPayment(rawText) {
+  const text = String(rawText || '').replace(/\s+/g, ' ');
+  return OWN_CARD_RE.test(text);
+}
+
 function classify(lead, around) {
   const t = lead.toLowerCase();
   const w = around.toLowerCase();
-  // "Abono a tarjeta de credito ... en Pesos/Dolares": Bancolombia debita de
-  // ahorros para pagar la tarjeta. No es ingreso (dice "abono") ni gasto nuevo
-  // (las compras de la tarjeta ya se registraron) -> queda para revision.
-  if (/(para abonar a la deuda|abono a (?:tu |la )?tarjeta de cr[eé]dito)/.test(w)) return null;
+  if (isOwnCardPayment(w)) return null;
   if (/\bcompr\w*/.test(t)) return { kind: 'compra', type: 'expense', label: 'Compra con tarjeta' };
   if (/\bretir\w*/.test(t)) return { kind: 'retiro', type: 'expense', label: 'Retiro' };
   if (/\bpag(?:o|ue|aste|ando)\b/.test(t)) return { kind: 'pago', type: 'expense', label: 'Pago' };
@@ -119,6 +127,7 @@ export function looksLikeTransaction(rawText) {
 export function parseBancolombiaAlert(rawText) {
   const text = String(rawText || '').replace(/\s+/g, ' ').trim();
   if (!text) return null;
+  if (isOwnCardPayment(text)) return null;
 
   const amtMatch = AMOUNT_RE.exec(text);
   if (!amtMatch) return null;

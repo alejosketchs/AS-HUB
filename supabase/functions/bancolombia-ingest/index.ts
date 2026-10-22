@@ -1,5 +1,5 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
-import { looksLikeTransaction, parseBancolombiaAlert } from './parser.js';
+import { isOwnCardPayment, looksLikeTransaction, parseBancolombiaAlert } from './parser.js';
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -46,19 +46,26 @@ Deno.serve(async (req: Request) => {
 
   const db = createClient(Deno.env.get('SUPABASE_URL') ?? '', Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '');
 
-  const parsed = parseBancolombiaAlert(rawText);
+  // Pago de la tarjeta propia ("Abono a tarjeta de credito ... en Pesos/en
+  // Dolares"): no es ingreso. Se guarda el correo para el antiduplicados y
+  // queda ignored, fuera de la bandeja.
+  const ownCard = isOwnCardPayment(rawText);
+  const parsed = ownCard ? null : parseBancolombiaAlert(rawText);
   // Sin monto ("$" o "COP") en el correo no es una transaccion (extracto,
   // aviso de seguridad, promocion...): se guarda para el antiduplicados pero
   // nunca se muestra en la bandeja de revision.
-  const isTransaction = looksLikeTransaction(rawText);
+  const isTransaction = !ownCard && looksLikeTransaction(rawText);
   const initialStatus = isTransaction ? 'pending_review' : 'ignored';
 
   // Antiduplicados: el message id de Gmail es la clave unica de la bandeja.
+  const insertRow: Record<string, unknown> = {
+    gmail_message_id: gmailMessageId, received_at: receivedDate.toISOString(), subject, raw_text: rawText,
+    status: initialStatus,
+  };
+  if (ownCard) insertRow.parsed = { ignored_reason: 'pago_tarjeta_propia' };
+
   const { data: inboxRow, error: insertErr } = await db.from('finance_email_inbox')
-    .insert({
-      gmail_message_id: gmailMessageId, received_at: receivedDate.toISOString(), subject, raw_text: rawText,
-      status: initialStatus,
-    })
+    .insert(insertRow)
     .select().single();
 
   if (insertErr) {
@@ -67,6 +74,7 @@ Deno.serve(async (req: Request) => {
     return json({ error: 'No se pudo guardar el correo en la bandeja' }, 500);
   }
 
+  if (ownCard) return json({ ok: true, status: 'ignored', reason: 'pago_tarjeta_propia' });
   if (!isTransaction) return json({ ok: true, status: 'ignored', reason: 'sin_monto' });
 
   let profileId: string | null = null;
