@@ -3,9 +3,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
-  AMOUNT_SRC, batchSkipReasons, CARD_BLOCK_PATTERNS, cardBlockReason, CREDIT_CARD_LAST4,
+  alertWindow, AMOUNT_SRC, batchSkipReasons, CARD_BLOCK_PATTERNS, cardBlockReason, CREDIT_CARD_LAST4,
   isCardSettlement, isOwnCardPayment, looksLikeTransaction, parseCOPAmount, parseBancolombiaAlert,
-  WINDOW_AFTER, WINDOW_BEFORE,
+  SAVINGS_TO_CARD_SRC, WINDOW_AFTER, WINDOW_BEFORE,
 } from './parser.js';
 import { isCardSettlement as isCardSettlementApp, isOwnCardPayment as isOwnCardPaymentApp } from '../../../js/bancolombia-text.js';
 
@@ -282,13 +282,18 @@ test('reverso en la 1887 es un ingreso y no una compra', () => {
   assert.equal(r.kind, 'reverso');
   assert.equal(r.last4, '1887');
   assert.equal(r.amount, 40000);
-  assert.equal(cardBlockReason(raw, r), 'ingreso_tarjeta_credito');
+  assert.equal(cardBlockReason(raw, r), 'reverso');
 });
 
 test('Aprobar todas usa los mismos patrones, la misma ventana y los mismos campos', () => {
   const sql = readFileSync(new URL('../../../docs/migracion-bandeja-aprobar-2026-10.sql', import.meta.url), 'utf8');
   const found = [...sql.matchAll(/~\*\s*'([^']*)'/g)].map((m) => m[1]);
-  assert.deepEqual(found, CARD_BLOCK_PATTERNS.map((p) => p.source));
+  assert.deepEqual(found, [
+    ...CARD_BLOCK_PATTERNS.map((p) => p.sql || p.source),
+    SAVINGS_TO_CARD_SRC,
+  ]);
+  assert.match(sql, /substr\(v_text, 1, v_at \+ 260\)/);
+  assert.match(sql, /parsed->>'kind' = 'reverso'/);
   assert.ok(sql.includes(AMOUNT_SRC));
   assert.match(sql, new RegExp(`v_at - ${WINDOW_BEFORE}`));
   assert.match(sql, new RegExp(`v_at \\+ ${WINDOW_AFTER}`));
@@ -314,6 +319,46 @@ test('Aprobar todas usa los mismos patrones, la misma ventana y los mismos campo
     parsed: { amount: 10000, category_id: 'cat', type: 'income', last4: '1887' },
   };
   assert.ok(batchSkipReasons(abono).includes('ingreso_tarjeta_credito'));
+  const reverso = {
+    ...listo,
+    parsed: { ...listo.parsed, kind: 'reverso', type: 'income', last4: '5076' },
+  };
+  assert.ok(batchSkipReasons(reverso).includes('reverso'));
+});
+
+test('una compra con "devolución" después del monto sigue siendo compra', () => {
+  const raw = 'Bancolombia: Compraste $45.000 en TIENDA con tu T.Deb *5076. '
+    + 'La devolución de puntos se ve en la app el 21/10/2026 a las 15:00.' + FOOTER;
+  const r = parseBancolombiaAlert(raw);
+  assert.ok(r);
+  assert.equal(r.kind, 'compra');
+  assert.equal(r.type, 'expense');
+  assert.equal(r.last4, '5076');
+  assert.equal(cardBlockReason(raw, r), null);
+});
+
+test('un pago con *8213 lejos del monto, antes del valor, no se crea como gasto', () => {
+  const puente = 'x'.repeat(80);
+  const raw = `Cuenta *8213 ${puente}Bancolombia: Pagaste $76.056,27 a tu T.Cred *1887 el 21/10/2026.`;
+  assert.equal(alertWindow(raw).includes('*8213'), false);
+  const r = parseBancolombiaAlert(raw);
+  assert.ok(r);
+  assert.equal(cardBlockReason(raw, r), 'pago_desde_8213');
+  const pie = 'Compraste $10.000 en TIENDA con tu T.Cred *1887 el 21/10/2026.'
+    + `${' aviso'.repeat(80)} cuenta *8213`;
+  assert.equal(cardBlockReason(pie, parseBancolombiaAlert(pie)), null);
+});
+
+test('"una tarjeta de crédito" cerca del monto no es un pago de la tarjeta', () => {
+  const raw = 'Bancolombia: Compraste $18.000 en LIBRERIA con una tarjeta de crédito *5076 '
+    + 'el 21/10/2026 a las 11:00.' + FOOTER;
+  assert.equal(isCardSettlement(raw), false);
+  assert.equal(isOwnCardPayment(raw), false);
+  const r = parseBancolombiaAlert(raw);
+  assert.ok(r);
+  assert.equal(r.kind, 'compra');
+  assert.equal(cardBlockReason(raw, r), null);
+  assert.equal(isCardSettlement('Pagaste $10.000 a tu tarjeta de crédito *1887'), true);
 });
 
 test('un abono que no es pago de la tarjeta propia sigue pudiendo ser ingreso', () => {

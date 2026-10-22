@@ -3,9 +3,9 @@
 -- Este archivo NO se aplica solo. Hay que correrlo a mano en el SQL editor
 -- de Supabase (proyecto Suite Personal, derzetuipyugmrjaxcyu).
 -- Se puede volver a correr: reemplaza las funciones y no borra filas.
--- El orden de despliegue no es estricto: las tres tarjetas y el índice único
--- de tarjetas ya están en vivo (ver paso 4), así que correr esto antes o
--- después de la función no cambia el registro de esas tarjetas.
+-- El orden de despliegue no es estricto. Las tres tarjetas ya están en vivo
+-- (ver paso 4). El índice único finance_card_profiles_profile_last4_uidx
+-- no existe todavía: el paso 4 lo crea si no existe.
 --
 -- Las filas que YA están en la bandeja (pending_review) no se convierten en
 -- movimientos aquí: esas siguen entrando solo cuando se aprueban.
@@ -126,9 +126,10 @@ $$;
 -- 3. Aprueba en lote las filas pendientes que ya traen perfil, monto,
 --    categoría y tipo (ingreso o gasto): la misma lista que inboxMissing.
 --    O quedan todas o ninguna. Lo incompleto se devuelve en skipped.
---    El bloqueo de tarjeta usa los mismos patrones que el JS y solo los
---    mira en la ventana del monto (40 caracteres antes, 260 después), no
---    en el pie del correo. Un ingreso de la 1887 tampoco entra en el lote.
+--    Las frases de abono se miran en la ventana del monto (40 antes, 260
+--    después), no en el pie. El pago 8213 → 1887 se mira desde el inicio
+--    hasta 260 después del monto. Un ingreso de la 1887, o un reverso,
+--    tampoco entra en el lote.
 create or replace function finance_inbox_apply_batch(p_inbox_ids uuid[])
 returns jsonb
 language plpgsql
@@ -142,6 +143,7 @@ declare
   v_at int;
   v_from int;
   v_window text;
+  v_head text;
 begin
   for r in select * from finance_email_inbox where id = any(p_inbox_ids) order by received_at for update loop
     v_text := btrim(regexp_replace(coalesce(r.raw_text, ''), '[[:space:]]+', ' ', 'g'));
@@ -149,20 +151,23 @@ begin
     if v_at > 0 then
       v_from := greatest(v_at - 40, 1);
       v_window := substr(v_text, v_from, (v_at + 260) - v_from);
+      v_head := substr(v_text, 1, v_at + 260);
     else
       v_window := '';
+      v_head := '';
     end if;
     if r.status <> 'pending_review' or r.profile_id is null or r.parsed is null
        or coalesce((r.parsed->>'amount')::numeric, 0) <= 0
        or nullif(r.parsed->>'category_id', '') is null
        or coalesce(r.parsed->>'type', '') not in ('income', 'expense')
        or (coalesce(r.parsed->>'last4', '') = '1887' and coalesce(r.parsed->>'type', '') = 'income')
+       or r.parsed->>'kind' = 'reverso'
        or r.parsed->>'ignored_reason' = 'pago_tarjeta_propia'
        or v_window ~* 'para abonar a la deuda'
        or v_window ~* 'abono a (?:tu |la )?tarjeta de cr[eé]dito'
-       or v_window ~* 'a (?:tu |la )?tarjeta de cr[eé]dito'
+       or v_window ~* '(^|[^[:alnum:]])a (tu |la )?tarjeta de cr[eé]dito'
        or v_window ~* 'pago (?:a |de )(?:tu |la )?tarjeta de cr[eé]dito'
-       or v_window ~* '\*1887.{0,180}\*8213|\*8213.{0,180}\*1887' then
+       or v_head ~* '\*1887[\s\S]{0,220}\*8213|\*8213[\s\S]{0,220}\*1887' then
       v_skipped := v_skipped || to_jsonb(r.id);
       continue;
     end if;
@@ -186,11 +191,11 @@ grant execute on function finance_inbox_apply_batch(uuid[]) to anon, authenticat
 
 -- 4. Las tres tarjetas de Alejo ya están registradas en vivo desde el
 --    21 de octubre de 2026, en el perfil alejo: 5076 Tarjeta débito compras,
---    8213 Cuenta ahorros y 1887 T. crédito Mastercard. El índice único
---    finance_card_profiles_profile_last4_uidx también ya existe. Este paso
---    no hace nada en esa base: el índice es IF NOT EXISTS y el insert solo
---    agrega un par perfil + últimos 4 que todavía no esté. No borra ni pisa
---    una etiqueta. No hace falta correrlo antes que la función.
+--    8213 Cuenta ahorros y 1887 T. crédito Mastercard. El insert de abajo
+--    no agrega un par que ya exista y no pisa una etiqueta.
+--    El índice único finance_card_profiles_profile_last4_uidx no existe
+--    en vivo. Este paso lo crea si no existe, y solo si no hay pares
+--    perfil + últimos 4 repetidos. No borra filas.
 do $cards$
 declare
   v_dupes int;

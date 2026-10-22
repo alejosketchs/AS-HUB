@@ -89,21 +89,31 @@ export const WINDOW_AFTER = 260;
 export const CREDIT_CARD_LAST4 = '1887';
 export const SAVINGS_LAST4 = '8213';
 
-// Mismos textos en el SQL de "Aprobar todas" (Postgres ~*). Sin lookahead:
-// eso no existe en Postgres y haría dos reglas distintas.
-// "a tu/la tarjeta de crédito" es un abono. "en NETFLIX con tu tarjeta" no.
+// Frases de abono, solo en la ventana del monto. "una tarjeta de crédito"
+// no cuenta: la "a" tiene que ser palabra, no la última letra de "una".
+// En Postgres \b no es límite de palabra, así que esa frase tiene otra forma
+// en el SQL (campo sql). El resto coincide letra por letra.
 export const CARD_BLOCK_PATTERNS = [
   { reason: 'pago_tarjeta_propia', source: String.raw`para abonar a la deuda` },
   { reason: 'pago_tarjeta_propia', source: String.raw`abono a (?:tu |la )?tarjeta de cr[eé]dito` },
-  { reason: 'pago_tarjeta_propia', source: String.raw`a (?:tu |la )?tarjeta de cr[eé]dito` },
+  {
+    reason: 'pago_tarjeta_propia',
+    source: String.raw`(?:^|[^A-Za-zÀ-ÿ0-9])a (?:tu |la )?tarjeta de cr[eé]dito`,
+    sql: String.raw`(^|[^[:alnum:]])a (tu |la )?tarjeta de cr[eé]dito`,
+  },
   { reason: 'pago_tarjeta_propia', source: String.raw`pago (?:a |de )(?:tu |la )?tarjeta de cr[eé]dito` },
-  { reason: 'pago_desde_8213', source: String.raw`\*1887.{0,180}\*8213|\*8213.{0,180}\*1887` },
 ];
+
+// Pago 8213 → 1887. Se busca desde el inicio del correo hasta 260 caracteres
+// después del monto: el *8213 puede ir bastante antes del valor. No se mira
+// el pie, que queda más allá de ese corte.
+export const SAVINGS_TO_CARD_SRC = String.raw`\*1887[\s\S]{0,220}\*8213|\*8213[\s\S]{0,220}\*1887`;
 
 const CARD_BLOCK_RES = CARD_BLOCK_PATTERNS.map((p) => ({
   reason: p.reason,
   re: new RegExp(p.source, 'i'),
 }));
+const SAVINGS_TO_CARD_RE = new RegExp(SAVINGS_TO_CARD_SRC, 'i');
 
 // "$59.900" o "COP59.900". El mismo texto va en el SQL para ubicar la ventana.
 export const AMOUNT_SRC = String.raw`(?:\$|COP)\s*([0-9][0-9.,]*[0-9]|[0-9])`;
@@ -135,16 +145,22 @@ export function isCardSettlement(rawText) {
 
 /**
  * Por qué este correo no debe crear un movimiento solo, o null si puede.
- * Un ingreso de la 1887 (abono, reverso, devolución) nunca entra solo.
- * Un pago desde la 8213 hacia la 1887 tampoco, aunque diga "T.Cred".
+ * Un reverso o una devolución, en cualquier tarjeta, no entra solo.
+ * Un ingreso de la 1887 tampoco. Un pago desde la 8213 hacia la 1887
+ * se detecta en el texto que va hasta 260 caracteres después del monto.
  */
 export function cardBlockReason(rawText, parsed) {
   if (parsed?.ignored_reason === 'pago_tarjeta_propia') return 'pago_tarjeta_propia';
+  if (parsed?.kind === 'reverso') return 'reverso';
   if (String(parsed?.last4 || '') === CREDIT_CARD_LAST4 && parsed?.type === 'income') {
     return 'ingreso_tarjeta_credito';
   }
-  const window = alertWindow(rawText);
-  if (!window) return null;
+  const text = flat(rawText);
+  const amt = AMOUNT_RE.exec(text);
+  if (!amt) return null;
+  const head = text.slice(0, amt.index + WINDOW_AFTER);
+  if (SAVINGS_TO_CARD_RE.test(head)) return 'pago_desde_8213';
+  const window = text.slice(Math.max(0, amt.index - WINDOW_BEFORE), amt.index + WINDOW_AFTER);
   for (const p of CARD_BLOCK_RES) {
     if (p.re.test(window)) return p.reason;
   }
@@ -171,9 +187,10 @@ export function batchSkipReasons(item) {
 function classify(lead, around) {
   const t = lead.toLowerCase();
   const w = around.toLowerCase();
-  // "Reverso de compra" trae la palabra compra, pero es un ingreso de la tarjeta.
-  // Se mira antes que el verbo de compra para no anotarlo como un gasto nuevo.
-  if (/\brevers|\bdevolu/.test(t) || /\brevers|\bdevolu/.test(w)) {
+  // "Reverso de compra" trae la palabra compra, pero es un ingreso.
+  // Solo cuenta si está ANTES del monto. Si "devolución" va después
+  // (en el detalle, cerca del valor), la compra sigue siendo compra.
+  if (/\brevers|\bdevolu/.test(t)) {
     return { kind: 'reverso', type: 'income', label: 'Reverso o devolución' };
   }
   if (/\bcompr\w*/.test(t)) return { kind: 'compra', type: 'expense', label: 'Compra con tarjeta' };

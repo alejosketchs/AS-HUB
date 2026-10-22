@@ -73,8 +73,44 @@ test('un reverso en la 1887 no se crea solo', () => {
   const plan = planNewAlert(raw);
   assert.equal(plan.createTransaction, false);
   assert.equal(plan.status, 'pending_review');
-  assert.equal(plan.reason, 'ingreso_tarjeta_credito');
+  assert.equal(plan.reason, 'reverso');
   assert.equal(plan.parsed.kind, 'reverso');
+});
+
+test('una compra con "devolución" cerca del monto sí puede entrar sola', () => {
+  const raw = 'Bancolombia: Compraste $45.000 en TIENDA con tu T.Deb *5076. '
+    + 'La devolución de puntos se ve en la app el 21/10/2026 a las 15:00.' + FOOTER;
+  const plan = planNewAlert(raw);
+  assert.equal(plan.createTransaction, true);
+  assert.equal(plan.parsed.kind, 'compra');
+  assert.equal(plan.parsed.last4, '5076');
+});
+
+test('un pago con *8213 lejos del monto no se crea como gasto', () => {
+  const puente = 'x'.repeat(80);
+  const raw = `Cuenta *8213 ${puente}Bancolombia: Pagaste $76.056,27 a tu T.Cred *1887 el 21/10/2026.`;
+  const plan = planNewAlert(raw);
+  assert.equal(plan.createTransaction, false);
+  assert.equal(plan.status, 'pending_review');
+  assert.equal(plan.reason, 'pago_desde_8213');
+});
+
+test('"una tarjeta de crédito" cerca del monto no frena la compra', () => {
+  const raw = 'Bancolombia: Compraste $18.000 en LIBRERIA con una tarjeta de crédito *5076 '
+    + 'el 21/10/2026 a las 11:00.' + FOOTER;
+  const plan = planNewAlert(raw);
+  assert.equal(plan.createTransaction, true);
+  assert.equal(plan.parsed.kind, 'compra');
+  assert.equal(plan.parsed.amount, 18000);
+});
+
+test('un reverso en otra tarjeta distinta de la 1887 tampoco se crea solo', () => {
+  const raw = 'Bancolombia: Devolución por $15.000 en tu T.Deb *5076 el 21/10/2026 a las 12:00.' + FOOTER;
+  const plan = planNewAlert(raw);
+  assert.equal(plan.createTransaction, false);
+  assert.equal(plan.status, 'pending_review');
+  assert.equal(plan.reason, 'reverso');
+  assert.equal(plan.parsed.last4, '5076');
 });
 
 test('el pie con "tarjeta de crédito" no frena una compra real', () => {

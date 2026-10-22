@@ -846,8 +846,9 @@ const INBOX_GAP_LABEL = {
   pago_tarjeta_propia: 'pago de tu tarjeta (no entra solo)',
   ingreso_tarjeta_credito: 'ingreso de la tarjeta de crédito (no entra solo)',
   pago_desde_8213: 'pago desde ahorros a la tarjeta (no entra solo)',
+  reverso: 'reverso o devolución (no entra solo)',
 };
-const INBOX_BLOCKS = new Set(['pago_tarjeta_propia', 'ingreso_tarjeta_credito', 'pago_desde_8213']);
+const INBOX_BLOCKS = new Set(['pago_tarjeta_propia', 'ingreso_tarjeta_credito', 'pago_desde_8213', 'reverso']);
 
 function inboxCodes(item) {
   return batchSkipReasons(item).filter((k) => k !== 'estado');
