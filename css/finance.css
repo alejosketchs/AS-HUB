@@ -369,6 +369,8 @@ button.finBox:active{transform:translate(2px,2px)}
 .finLine .finDot{flex:none;display:grid;place-items:center;width:22px;height:22px;font:900 12px var(--mono);font-style:normal;border:2px solid var(--fn-ink);background:var(--fn-panel)}
 .finLine.is-done .finDot{background:var(--fn-lime)}
 .finLine span small{font:650 11px var(--sans);color:var(--fn-mute)}
+.finLine.is-incomplete{background:var(--fn-pink-soft);border-left:4px solid var(--fn-pink);padding-left:8px}
+.finLine span small.finMissing{color:var(--fn-red);font-weight:800}
 .finDebtNext{margin-top:6px;font:650 12px var(--sans);color:#3c3c34}
 .finDebtNext b{display:inline;margin:0;font:800 12px var(--mono)}
 .finRhythm{display:grid;gap:12px}

@@ -194,6 +194,10 @@ export const Finance = {
       .eq('status', 'pending_review').order('received_at', { ascending: false }));
   },
   async updateInbox(id, patch) { return unwrap(await sb.from('finance_email_inbox').update(patch).eq('id', id).select().single()); },
+  /* Crea el movimiento y marca la fila como applied en una sola transacción (RPC). Devuelve el id del movimiento. */
+  async applyInbox(id, tx) { return unwrap(await sb.rpc('finance_inbox_apply', { p_inbox_id: id, p_tx: tx })); },
+  /* Aprueba en lote las filas listas; devuelve { applied: [ids], skipped: [ids] }. */
+  async applyInboxBatch(ids) { return unwrap(await sb.rpc('finance_inbox_apply_batch', { p_inbox_ids: ids })); },
 
   /* Reglas de categoría automática por comercio (ingesta automática). */
   async merchantRules(profileId) {

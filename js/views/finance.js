@@ -831,13 +831,27 @@ function cardProfileSheet(c) {
 }
 
 /* ============================ bandeja de revisión ============================ */
+/** Qué le falta a una fila de la bandeja para poder aprobarse en lote (vacío = lista). */
+function inboxMissing(item) {
+  const p = item.parsed;
+  const missing = [];
+  if (!item.profile_id) missing.push('perfil');
+  if (!(n(p?.amount) > 0)) missing.push('monto');
+  if (!p?.category_id) missing.push('categoría');
+  if (p && !['income', 'expense'].includes(p.type)) missing.push('tipo');
+  return missing;
+}
+
 function inboxItemHTML(item) {
   const p = item.parsed;
   const guess = p ? `${p.type === 'income' ? '+' : '−'} ${money(p.amount)} · ${p.description}${p.last4 ? ' · ••••' + p.last4 : ''}`
     : 'No se reconoció el formato del correo';
+  const cat = p?.category_name ? ` · ${p.category_name}${p.subcategory_name ? ' › ' + p.subcategory_name : ''}` : '';
+  const missing = inboxMissing(item);
   return html`
-    <div class="finLine" data-inbox="${item.id}" style="flex-wrap:wrap">
-      <span><b>${item.subject || 'Correo de Bancolombia'}</b><small>${timeOf(item.received_at) ? dateAt(item.received_at.slice(0, 10)).toLocaleDateString('es-CO') + ' · ' : ''}${guess}</small></span>
+    <div class="finLine ${missing.length ? 'is-incomplete' : ''}" data-inbox="${item.id}" style="flex-wrap:wrap">
+      <span><b>${item.subject || 'Correo de Bancolombia'}</b><small>${timeOf(item.received_at) ? dateAt(dayOf(item.received_at)).toLocaleDateString('es-CO') + ' · ' : ''}${guess}${cat}</small>
+        ${missing.length ? H`<small class="finMissing">Falta: ${missing.join(', ')}</small>` : ''}</span>
       <span class="finIcons" style="flex:none">
         <button class="finBtn finBtn--sm" type="button" data-act="inbox-complete">Completar</button>
         <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act="inbox-ignore">Ignorar</button>
@@ -846,16 +860,23 @@ function inboxItemHTML(item) {
 }
 
 function inboxSheet() {
+  const ready = state.inboxPending.filter((x) => !inboxMissing(x).length);
   sheet({
     title: 'Bandeja de revisión',
     body: html`
       <p class="sheetText">Correos del banco que no se pudieron asignar solos: formato no reconocido o tarjeta/cuenta sin mapear.</p>
+      ${ready.length ? H`<button class="finBtn finBtn--sm" type="button" data-act="inbox-approve-all">✓ Aprobar todas (${ready.length})</button>` : ''}
       <div class="finLines">${state.inboxPending.length ? raw(state.inboxPending.map(inboxItemHTML).join(''))
     : H`<div class="finEmpty">Sin pendientes 🎉</div>`}</div>`,
     onOpen: ({ root: r, close }) => {
       r.addEventListener('click', (e) => {
         const btn = e.target.closest('[data-act]');
         if (!btn) return;
+        if (btn.dataset.act === 'inbox-approve-all') {
+          close();
+          setTimeout(() => inboxApproveAllSheet(ready), 220);
+          return;
+        }
         const id = btn.closest('[data-inbox]').dataset.inbox;
         const item = state.inboxPending.find((x) => x.id === id);
         if (!item) return;
@@ -872,6 +893,36 @@ function inboxSheet() {
       });
     },
     actions: [{ label: 'Cerrar', onClick: ({ close }) => close() }],
+  });
+}
+
+/** Confirma y aprueba en lote las filas listas; las incompletas siguen pendientes y resaltadas. */
+function inboxApproveAllSheet(ready) {
+  const sum = (type) => ready.filter((x) => x.parsed.type === type).reduce((s, x) => s + n(x.parsed.amount), 0);
+  const expense = sum('expense');
+  const income = sum('income');
+  const pending = state.inboxPending.length - ready.length;
+  sheet({
+    title: 'Aprobar todas',
+    body: html`
+      <p class="sheetText">Se crearán <b>${ready.length}</b> movimientos con la categoría que trae cada correo.</p>
+      <p class="sheetText">${expense ? `Gastos: ${money(expense)}` : ''}${expense && income ? ' · ' : ''}${income ? `Ingresos: ${money(income)}` : ''}</p>
+      ${pending ? H`<p class="sheetText">${pending} sin perfil, monto o categoría se quedan pendientes.</p>` : ''}`,
+    actions: [
+      { label: 'Cancelar', onClick: ({ close }) => close() },
+      {
+        label: 'Sí, aprobar', variant: 'primary', onClick: async ({ close }) => {
+          close();
+          try {
+            const res = await Finance.applyInboxBatch(ready.map((x) => x.id));
+            await loadAll({ silent: true });
+            const skipped = res?.skipped?.length || 0;
+            toast(`${res?.applied?.length || 0} aprobadas${skipped ? ` · ${skipped} quedan pendientes` : ''}`);
+            if (state.inboxPending.length) setTimeout(inboxSheet, 220);
+          } catch { toast('No se pudo aprobar; no se creó ningún movimiento', 'err'); }
+        },
+      },
+    ],
   });
 }
 
@@ -1385,12 +1436,12 @@ function txSheet(tx, inboxItem) {
     type: tx?.type || guess?.type || 'expense',
     amount: tx ? n(tx.amount) : (guess?.amount || ''),
     date: tx?.transaction_date || (inboxItem ? dayOf(inboxItem.received_at) : todayISO()),
-    category_id: tx?.category_id || '',
-    subcategory_id: tx?.subcategory_id || '',
+    category_id: tx?.category_id || guess?.category_id || '',
+    subcategory_id: tx?.subcategory_id || guess?.subcategory_id || '',
     goal_id: tx?.goal_id || state.goals[0]?.id || '',
     description: tx?.description || guess?.description || '',
-    reimbursable: !!tx?.reimbursable,
-    reimburse_by: tx?.reimburse_by || '',
+    reimbursable: tx ? !!tx.reimbursable : !!guess?.reimbursable,
+    reimburse_by: tx?.reimburse_by || guess?.reimburse_by || '',
   };
   const seg = data.type === 'income' ? 'income' : (data.type === 'expense' ? 'expense' : 'saving');
   let segType = seg;
@@ -1554,12 +1605,8 @@ function txSheet(tx, inboxItem) {
         if (saving && !payload.goal_id) { toast('Crea una meta de ahorro primero', 'err'); return; }
         // El momento del movimiento se fija al crearlo y no se toca al editar,
         // para no reescribir la hora real de algo registrado antes.
-        if (!editing) payload.occurred_at = new Date().toISOString();
-        if (!editing && inboxItem) {
-          payload.source = 'automatico';
-          payload.source_message_id = inboxItem.gmail_message_id;
-          payload.source_raw_text = inboxItem.raw_text;
-        }
+        // Desde la bandeja, la hora es la del correo (received_at): la pone la RPC.
+        if (!editing && !inboxItem) payload.occurred_at = new Date().toISOString();
         try {
           if (editing) {
             await Finance.updateTransaction(tx.id, payload);
@@ -1568,12 +1615,13 @@ function txSheet(tx, inboxItem) {
               await applyGoal(tx.goal_id, -goalDelta(tx));
               await applyGoal(payload.goal_id, goalDelta(payload));
             }
-          } else {
-            const created = await Finance.addTransaction(payload);
+          } else if (inboxItem) {
+            // Movimiento + fila applied en una sola transacción (finance_inbox_apply).
+            await Finance.applyInbox(inboxItem.id, payload);
             await applyGoal(payload.goal_id, goalDelta(payload));
-            if (inboxItem) {
-              await Finance.updateInbox(inboxItem.id, { status: 'applied', transaction_id: created.id, profile_id: state.profileId });
-            }
+          } else {
+            await Finance.addTransaction(payload);
+            await applyGoal(payload.goal_id, goalDelta(payload));
           }
           close();
           await loadAll({ silent: true });

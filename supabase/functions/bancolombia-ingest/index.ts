@@ -1,5 +1,5 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
-import { parseBancolombiaAlert } from './parser.js';
+import { looksLikeTransaction, parseBancolombiaAlert } from './parser.js';
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -47,11 +47,11 @@ Deno.serve(async (req: Request) => {
   const db = createClient(Deno.env.get('SUPABASE_URL') ?? '', Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '');
 
   const parsed = parseBancolombiaAlert(rawText);
-  // Sin "$" en el correo no es una transaccion (extracto, aviso de seguridad,
-  // promocion...): se guarda para el antiduplicados pero nunca se muestra en
-  // la bandeja de revision.
-  const looksLikeTransaction = /\$\s*[0-9]/.test(rawText);
-  const initialStatus = looksLikeTransaction ? 'pending_review' : 'ignored';
+  // Sin monto ("$" o "COP") en el correo no es una transaccion (extracto,
+  // aviso de seguridad, promocion...): se guarda para el antiduplicados pero
+  // nunca se muestra en la bandeja de revision.
+  const isTransaction = looksLikeTransaction(rawText);
+  const initialStatus = isTransaction ? 'pending_review' : 'ignored';
 
   // Antiduplicados: el message id de Gmail es la clave unica de la bandeja.
   const { data: inboxRow, error: insertErr } = await db.from('finance_email_inbox')
@@ -67,7 +67,7 @@ Deno.serve(async (req: Request) => {
     return json({ error: 'No se pudo guardar el correo en la bandeja' }, 500);
   }
 
-  if (!looksLikeTransaction) return json({ ok: true, status: 'ignored', reason: 'sin_monto' });
+  if (!isTransaction) return json({ ok: true, status: 'ignored', reason: 'sin_monto' });
 
   let profileId: string | null = null;
   if (parsed?.last4) {

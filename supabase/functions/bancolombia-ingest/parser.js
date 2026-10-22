@@ -81,12 +81,16 @@ function extractCounterpart(text) {
  */
 function classify(lead, around) {
   const t = lead.toLowerCase();
+  const w = around.toLowerCase();
+  // "Abono a tarjeta de credito ... en Pesos/Dolares": Bancolombia debita de
+  // ahorros para pagar la tarjeta. No es ingreso (dice "abono") ni gasto nuevo
+  // (las compras de la tarjeta ya se registraron) -> queda para revision.
+  if (/(para abonar a la deuda|abono a (?:tu |la )?tarjeta de cr[eé]dito)/.test(w)) return null;
   if (/\bcompr\w*/.test(t)) return { kind: 'compra', type: 'expense', label: 'Compra con tarjeta' };
   if (/\bretir\w*/.test(t)) return { kind: 'retiro', type: 'expense', label: 'Retiro' };
   if (/\bpag(?:o|ue|aste|ando)\b/.test(t)) return { kind: 'pago', type: 'expense', label: 'Pago' };
 
   const esTransferencia = /\btransfer\w*/.test(t);
-  const w = around.toLowerCase();
   const recibida = /(ha recibido|recibiste|recibi[oó]|te transfirieron|te consignaron|abono|abonaron|consignaci[oó]n)/.test(w);
   const enviada = /(enviaste|enviad[ao]|envi[oó]|realizaste.*transfer\w*|desde (tu|su|mi) cuenta)/.test(w);
   if (esTransferencia && recibida) return { kind: 'transferencia_recibida', type: 'income', label: 'Transferencia recibida' };
@@ -98,6 +102,15 @@ function classify(lead, around) {
   return null;
 }
 
+// Monto con "$" ("$59.900") o con codigo de moneda pegado ("COP59.900,00",
+// lo usan algunas compras con tarjeta de credito).
+const AMOUNT_RE = /(?:\$|\bCOP)\s*([0-9][0-9.,]*[0-9]|[0-9])/;
+
+/** Hay un monto en el correo -> parece movimiento (no extracto, aviso ni promocion). */
+export function looksLikeTransaction(rawText) {
+  return AMOUNT_RE.test(String(rawText || ''));
+}
+
 /**
  * @param {string} rawText - cuerpo del correo (texto plano)
  * @returns {{type:'income'|'expense', kind:string, amount:number, currency:'COP',
@@ -107,7 +120,7 @@ export function parseBancolombiaAlert(rawText) {
   const text = String(rawText || '').replace(/\s+/g, ' ').trim();
   if (!text) return null;
 
-  const amtMatch = /\$\s*([0-9][0-9.,]*[0-9]|[0-9])/.exec(text);
+  const amtMatch = AMOUNT_RE.exec(text);
   if (!amtMatch) return null;
   const amount = parseCOPAmount(amtMatch[1]);
   if (!amount) return null;

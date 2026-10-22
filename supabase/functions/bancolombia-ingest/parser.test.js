@@ -1,7 +1,7 @@
 // Ejecutar con: node --test supabase/functions/bancolombia-ingest/parser.test.js
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCOPAmount, parseBancolombiaAlert } from './parser.js';
+import { looksLikeTransaction, parseCOPAmount, parseBancolombiaAlert } from './parser.js';
 
 // El pie de pagina real de Bancolombia repite este aviso en TODOS sus
 // correos (compras, pagos, retiros, transferencias por igual). Si el parser
@@ -156,4 +156,32 @@ test('formato desconocido devuelve null (nunca inventa datos)', () => {
   assert.equal(parseBancolombiaAlert('Su extracto mensual ya esta disponible.'), null);
   assert.equal(parseBancolombiaAlert(''), null);
   assert.equal(parseBancolombiaAlert('Compra realizada pero sin monto visible.'), null);
+});
+
+test('compra con monto en formato COP (tarjeta de credito)', () => {
+  const r = parseBancolombiaAlert(
+    'Bancolombia: Compraste COP59.900,00 en CapCut con tu T.Cred *1887, el 13/10/2026 a las 19:58.' + FOOTER,
+  );
+  assert.ok(r);
+  assert.equal(r.type, 'expense');
+  assert.equal(r.kind, 'compra');
+  assert.equal(r.amount, 59900);
+  assert.equal(r.last4, '1887');
+  assert.equal(r.description, 'CapCut');
+});
+
+test('looksLikeTransaction reconoce "$" y "COP"', () => {
+  assert.equal(looksLikeTransaction('Compraste COP23.500,00 en PARAMOUNT+'), true);
+  assert.equal(looksLikeTransaction('Compraste $23.500 en PARAMOUNT+'), true);
+  assert.equal(looksLikeTransaction('Llego tu extracto del mes'), false);
+});
+
+test('abono a tarjeta de credito desde ahorros NO es ingreso', () => {
+  for (const moneda of ['Pesos', 'Dólares']) {
+    const r = parseBancolombiaAlert(
+      `Bancolombia: Debitamos de tu cuenta/bolsillo $76,056.27 para abonar a la deuda en en ${moneda}. `
+      + 'de tu tarjeta de credito MASTER **1887. Encontraras el abono el proximo dia habil.' + FOOTER,
+    );
+    assert.equal(r, null);
+  }
 });
