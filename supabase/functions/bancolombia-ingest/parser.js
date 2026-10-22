@@ -79,13 +79,120 @@ function extractCounterpart(text) {
  * monto (antes y despues), donde Bancolombia sí pone la direccion real de
  * una transferencia ("...desde tu cuenta...").
  */
+// Ventana del monto: la misma que usa classify. El pie del correo
+// ("...tu tarjeta de crédito...") queda fuera y no puede decidir el tipo.
+export const WINDOW_BEFORE = 40;
+export const WINDOW_AFTER = 260;
+
+// Tarjeta de crédito y cuenta de ahorros de Alejo. La regla es por número,
+// no por cómo esté redactado el correo ("T.Cred *1887" no dice "tarjeta de crédito").
+export const CREDIT_CARD_LAST4 = '1887';
+export const SAVINGS_LAST4 = '8213';
+
+// Frases de abono, solo en la ventana del monto. "una tarjeta de crédito"
+// no cuenta: la "a" tiene que ser palabra, no la última letra de "una".
+// En Postgres \b no es límite de palabra, así que esa frase tiene otra forma
+// en el SQL (campo sql). El resto coincide letra por letra.
+export const CARD_BLOCK_PATTERNS = [
+  { reason: 'pago_tarjeta_propia', source: String.raw`para abonar a la deuda` },
+  { reason: 'pago_tarjeta_propia', source: String.raw`abono a (?:tu |la )?tarjeta de cr[eé]dito` },
+  {
+    reason: 'pago_tarjeta_propia',
+    source: String.raw`(?:^|[^A-Za-zÀ-ÿ0-9])a (?:tu |la )?tarjeta de cr[eé]dito`,
+    sql: String.raw`(^|[^[:alnum:]])a (tu |la )?tarjeta de cr[eé]dito`,
+  },
+  { reason: 'pago_tarjeta_propia', source: String.raw`pago (?:a |de )(?:tu |la )?tarjeta de cr[eé]dito` },
+];
+
+// Pago 8213 → 1887. Se busca desde el inicio del correo hasta 260 caracteres
+// después del monto: el *8213 puede ir bastante antes del valor. No se mira
+// el pie, que queda más allá de ese corte.
+export const SAVINGS_TO_CARD_SRC = String.raw`\*1887[\s\S]{0,220}\*8213|\*8213[\s\S]{0,220}\*1887`;
+
+const CARD_BLOCK_RES = CARD_BLOCK_PATTERNS.map((p) => ({
+  reason: p.reason,
+  re: new RegExp(p.source, 'i'),
+}));
+const SAVINGS_TO_CARD_RE = new RegExp(SAVINGS_TO_CARD_SRC, 'i');
+
+// "$59.900" o "COP59.900". El mismo texto va en el SQL para ubicar la ventana.
+export const AMOUNT_SRC = String.raw`(?:\$|COP)\s*([0-9][0-9.,]*[0-9]|[0-9])`;
+const AMOUNT_RE = new RegExp(AMOUNT_SRC);
+
+function flat(rawText) {
+  return String(rawText || '').replace(/\s+/g, ' ').trim();
+}
+
+/** Trozo alrededor del primer monto. Vacío si el correo no trae monto. */
+export function alertWindow(rawText) {
+  const text = flat(rawText);
+  const m = AMOUNT_RE.exec(text);
+  if (!m) return '';
+  return text.slice(Math.max(0, m.index - WINDOW_BEFORE), m.index + WINDOW_AFTER);
+}
+
+/** Frase de abono o pago de la deuda, solo dentro de la ventana del monto. */
+export function isOwnCardPayment(rawText) {
+  const window = alertWindow(rawText);
+  if (!window) return false;
+  return CARD_BLOCK_RES.some((p) => p.reason === 'pago_tarjeta_propia' && p.re.test(window));
+}
+
+/** Abono o pago de la deuda de la tarjeta, mirando solo la ventana del monto. */
+export function isCardSettlement(rawText) {
+  return isOwnCardPayment(rawText);
+}
+
+/**
+ * Por qué este correo no debe crear un movimiento solo, o null si puede.
+ * Un reverso o una devolución, en cualquier tarjeta, no entra solo.
+ * Un ingreso de la 1887 tampoco. Un pago desde la 8213 hacia la 1887
+ * se detecta en el texto que va hasta 260 caracteres después del monto.
+ */
+export function cardBlockReason(rawText, parsed) {
+  if (parsed?.ignored_reason === 'pago_tarjeta_propia') return 'pago_tarjeta_propia';
+  if (parsed?.kind === 'reverso') return 'reverso';
+  if (String(parsed?.last4 || '') === CREDIT_CARD_LAST4 && parsed?.type === 'income') {
+    return 'ingreso_tarjeta_credito';
+  }
+  const text = flat(rawText);
+  const amt = AMOUNT_RE.exec(text);
+  if (!amt) return null;
+  const head = text.slice(0, amt.index + WINDOW_AFTER);
+  if (SAVINGS_TO_CARD_RE.test(head)) return 'pago_desde_8213';
+  const window = text.slice(Math.max(0, amt.index - WINDOW_BEFORE), amt.index + WINDOW_AFTER);
+  for (const p of CARD_BLOCK_RES) {
+    if (p.re.test(window)) return p.reason;
+  }
+  return null;
+}
+
+/**
+ * Lo que "Aprobar todas" no debe tocar. Vacío = la fila está lista.
+ * Misma lista que el SQL: perfil, monto, categoría, tipo, y el bloqueo de tarjeta.
+ */
+export function batchSkipReasons(item) {
+  const parsed = item?.parsed ?? null;
+  const reasons = [];
+  if (item?.status && item.status !== 'pending_review') reasons.push('estado');
+  if (!item?.profile_id) reasons.push('perfil');
+  if (!(Number(parsed?.amount) > 0)) reasons.push('monto');
+  if (!parsed?.category_id) reasons.push('categoría');
+  if (!parsed || !['income', 'expense'].includes(parsed.type)) reasons.push('tipo');
+  const block = cardBlockReason(item?.raw_text || '', parsed);
+  if (block && !reasons.includes(block)) reasons.push(block);
+  return reasons;
+}
+
 function classify(lead, around) {
   const t = lead.toLowerCase();
   const w = around.toLowerCase();
-  // "Abono a tarjeta de credito ... en Pesos/Dolares": Bancolombia debita de
-  // ahorros para pagar la tarjeta. No es ingreso (dice "abono") ni gasto nuevo
-  // (las compras de la tarjeta ya se registraron) -> queda para revision.
-  if (/(para abonar a la deuda|abono a (?:tu |la )?tarjeta de cr[eé]dito)/.test(w)) return null;
+  // "Reverso de compra" trae la palabra compra, pero es un ingreso.
+  // Solo cuenta si está ANTES del monto. Si "devolución" va después
+  // (en el detalle, cerca del valor), la compra sigue siendo compra.
+  if (/\brevers|\bdevolu/.test(t)) {
+    return { kind: 'reverso', type: 'income', label: 'Reverso o devolución' };
+  }
   if (/\bcompr\w*/.test(t)) return { kind: 'compra', type: 'expense', label: 'Compra con tarjeta' };
   if (/\bretir\w*/.test(t)) return { kind: 'retiro', type: 'expense', label: 'Retiro' };
   if (/\bpag(?:o|ue|aste|ando)\b/.test(t)) return { kind: 'pago', type: 'expense', label: 'Pago' };
@@ -102,10 +209,6 @@ function classify(lead, around) {
   return null;
 }
 
-// Monto con "$" ("$59.900") o con codigo de moneda pegado ("COP59.900,00",
-// lo usan algunas compras con tarjeta de credito).
-const AMOUNT_RE = /(?:\$|\bCOP)\s*([0-9][0-9.,]*[0-9]|[0-9])/;
-
 /** Hay un monto en el correo -> parece movimiento (no extracto, aviso ni promocion). */
 export function looksLikeTransaction(rawText) {
   return AMOUNT_RE.test(String(rawText || ''));
@@ -117,7 +220,7 @@ export function looksLikeTransaction(rawText) {
  *            last4:string|null, description:string} | null}
  */
 export function parseBancolombiaAlert(rawText) {
-  const text = String(rawText || '').replace(/\s+/g, ' ').trim();
+  const text = flat(rawText);
   if (!text) return null;
 
   const amtMatch = AMOUNT_RE.exec(text);
@@ -130,7 +233,7 @@ export function parseBancolombiaAlert(rawText) {
   // transferencia van justo despues. Fuera de esa ventana es publicidad o el
   // aviso legal del pie, que no debe influir en la clasificacion.
   const lead = text.slice(0, amtMatch.index);
-  const around = text.slice(Math.max(0, amtMatch.index - 40), amtMatch.index + 260);
+  const around = text.slice(Math.max(0, amtMatch.index - WINDOW_BEFORE), amtMatch.index + WINDOW_AFTER);
 
   const cls = classify(lead, around);
   if (!cls) return null;

@@ -1,5 +1,5 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
-import { looksLikeTransaction, parseBancolombiaAlert } from './parser.js';
+import { pickManualTwin, planNewAlert, planReplay } from './decide.js';
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -18,6 +18,15 @@ const bogotaDateISO = (d: Date) => new Intl.DateTimeFormat('en-CA', {
 
 // Clave para emparejar reglas de comercio: mayusculas, espacios colapsados.
 const normMerchant = (s: string) => s.trim().toUpperCase().replace(/\s+/g, ' ');
+
+async function profileForLast4(db: ReturnType<typeof createClient>, last4: string | null) {
+  if (!last4) return null;
+  const { data: mapped, error: mapErr } = await db.from('finance_card_profiles')
+    .select('profile_id').eq('last4', last4).eq('active', true);
+  if (mapErr) console.error('lookup finance_card_profiles failed', mapErr);
+  const distinct = [...new Set((mapped || []).map((m: { profile_id: string }) => m.profile_id))];
+  return distinct.length === 1 ? distinct[0] : null;
+}
 
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: cors });
@@ -46,37 +55,47 @@ Deno.serve(async (req: Request) => {
 
   const db = createClient(Deno.env.get('SUPABASE_URL') ?? '', Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '');
 
-  const parsed = parseBancolombiaAlert(rawText);
-  // Sin monto ("$" o "COP") en el correo no es una transaccion (extracto,
-  // aviso de seguridad, promocion...): se guarda para el antiduplicados pero
-  // nunca se muestra en la bandeja de revision.
-  const isTransaction = looksLikeTransaction(rawText);
-  const initialStatus = isTransaction ? 'pending_review' : 'ignored';
+  const plan = planNewAlert(rawText);
+  // ignored solo si el correo no trae monto. Un abono, un reverso o un pago
+  // de la tarjeta queda pending_review: no se crea solo, pero se puede revisar.
+  const initialStatus = plan.status === 'ignored' ? 'ignored' : 'pending_review';
 
   // Antiduplicados: el message id de Gmail es la clave unica de la bandeja.
+  // Si ya existe, no se crea movimiento: esa fila entra al aprobarla, o ya
+  // quedó applied. Nunca por las dos vías.
+  const insertRow: Record<string, unknown> = {
+    gmail_message_id: gmailMessageId, received_at: receivedDate.toISOString(), subject, raw_text: rawText,
+    status: initialStatus,
+    parsed: plan.parsed,
+  };
+
   const { data: inboxRow, error: insertErr } = await db.from('finance_email_inbox')
-    .insert({
-      gmail_message_id: gmailMessageId, received_at: receivedDate.toISOString(), subject, raw_text: rawText,
-      status: initialStatus,
-    })
+    .insert(insertRow)
     .select().single();
 
   if (insertErr) {
-    if (insertErr.code === '23505') return json({ ok: true, duplicate: true });
+    if (insertErr.code === '23505') {
+      const { data: existing } = await db.from('finance_email_inbox')
+        .select('status').eq('gmail_message_id', gmailMessageId).maybeSingle();
+      const replay = planReplay(existing || { status: 'pending_review' });
+      return json({ ok: true, duplicate: true, status: replay.status, reason: replay.reason, createTransaction: false });
+    }
     console.error('insert finance_email_inbox failed', insertErr);
     return json({ error: 'No se pudo guardar el correo en la bandeja' }, 500);
   }
 
-  if (!isTransaction) return json({ ok: true, status: 'ignored', reason: 'sin_monto' });
+  const parsed = plan.parsed;
+  // 0 coincidencias = tarjeta sin mapear; 2+ = ambiguo. En ambos casos queda pendiente de revision.
+  const profileId = await profileForLast4(db, parsed?.last4 ?? null);
 
-  let profileId: string | null = null;
-  if (parsed?.last4) {
-    const { data: mapped, error: mapErr } = await db.from('finance_card_profiles')
-      .select('profile_id').eq('last4', parsed.last4).eq('active', true);
-    if (mapErr) console.error('lookup finance_card_profiles failed', mapErr);
-    const distinct = [...new Set((mapped || []).map((m) => m.profile_id))];
-    if (distinct.length === 1) profileId = distinct[0];
-    // 0 coincidencias = tarjeta sin mapear; 2+ = ambiguo. En ambos casos queda pendiente de revision.
+  if (!plan.createTransaction) {
+    if (parsed) {
+      const { error: updErr } = await db.from('finance_email_inbox')
+        .update({ parsed, profile_id: profileId })
+        .eq('id', inboxRow.id);
+      if (updErr) console.error('update finance_email_inbox (revision) failed', updErr);
+    }
+    return json({ ok: true, status: plan.status, reason: plan.reason });
   }
 
   if (!parsed || !profileId) {
@@ -90,19 +109,41 @@ Deno.serve(async (req: Request) => {
   const txDate = bogotaDateISO(receivedDate);
 
   // Ya lo registraste a mano antes de que llegara el correo: no crear otro
-  // movimiento, solo enlazar el correo al que ya existe. Si hay mas de una
-  // coincidencia no se adivina cual es (podrian ser dos compras reales del
-  // mismo monto el mismo dia) y se sigue el flujo normal.
+  // movimiento, solo enlazar el correo al que aún no tiene alerta. Si ese
+  // manual ya está enlazado a otro correo, no se reutiliza: sería la segunda
+  // compra del mismo monto el mismo día. Dos libres tampoco se adivinan.
   const { data: dupes, error: dupeErr } = await db.from('finance_transactions')
     .select('id').eq('profile_id', profileId).eq('source', 'manual')
     .eq('transaction_date', txDate).eq('type', parsed.type).eq('amount', parsed.amount);
   if (dupeErr) console.error('lookup duplicate finance_transactions failed', dupeErr);
-  if (dupes && dupes.length === 1) {
+  const dupeIds = (dupes || []).map((d: { id: string }) => d.id);
+  let linkedIds: string[] = [];
+  if (dupeIds.length) {
+    const { data: links, error: linkLookupErr } = await db.from('finance_email_inbox')
+      .select('transaction_id').in('transaction_id', dupeIds);
+    if (linkLookupErr) console.error('lookup linked manuals failed', linkLookupErr);
+    linkedIds = (links || []).map((l: { transaction_id: string }) => l.transaction_id);
+  }
+  const twin = pickManualTwin(dupes || [], linkedIds);
+  if (twin) {
     const { error: linkErr } = await db.from('finance_email_inbox')
-      .update({ status: 'applied', parsed, profile_id: profileId, transaction_id: dupes[0].id })
+      .update({ status: 'applied', parsed, profile_id: profileId, transaction_id: twin.id })
       .eq('id', inboxRow.id);
     if (linkErr) console.error('link duplicate finance_email_inbox failed', linkErr);
-    return json({ ok: true, status: 'applied', duplicate_of_manual: dupes[0].id });
+    return json({ ok: true, status: 'applied', duplicate_of_manual: twin.id });
+  }
+
+  // Si este correo ya originó un movimiento (por ejemplo lo aprobaron en la
+  // bandeja), no se inserta otro: se enlaza la fila a ese.
+  const { data: already, error: alreadyErr } = await db.from('finance_transactions')
+    .select('id').eq('source_message_id', gmailMessageId).order('created_at').limit(1);
+  if (alreadyErr) console.error('lookup source_message_id failed', alreadyErr);
+  if (already && already.length) {
+    const { error: linkErr } = await db.from('finance_email_inbox')
+      .update({ status: 'applied', parsed, profile_id: profileId, transaction_id: already[0].id })
+      .eq('id', inboxRow.id);
+    if (linkErr) console.error('link existing finance_email_inbox failed', linkErr);
+    return json({ ok: true, status: 'applied', transaction_id: already[0].id, already: true });
   }
 
   let catId: string | null = null;
