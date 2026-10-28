@@ -1,20 +1,24 @@
-// AS SUITE — sesión con PIN, compartida por todo el ecosistema
+// AS SUITE — entrada a la app
 //
 // Cómo funciona:
-//  1. Eliges perfil (Chori o Toli) y escribes tu PIN de 4 dígitos.
-//  2. El PIN se convierte en hash (SHA-256 con sal por perfil) y se compara
-//     contra el hash guardado en Supabase. El PIN nunca viaja ni se guarda en claro.
-//  3. Si coincide, se crea una fila en `sessions` con un token y su vencimiento.
-//     El navegador solo guarda ese token; la vigencia la manda la base.
-//  4. Cualquier app del Suite que tenga el token puede validarlo contra la misma
-//     base, así que la sesión funciona aunque las apps vivan en dominios distintos.
-//     Para pasarla a otro sitio se usa el enlace con #as=<token> (ver linkConSesion).
+//  1. Sesión real: correo + contraseña con Supabase Auth (js/supabase.js).
+//     Sin esa sesión la base no deja leer ni escribir nada (RLS, ver
+//     docs/seguridad.md). Queda recordada en este dispositivo y se renueva sola.
+//  2. Bloqueo rápido: eliges perfil (Shori o Toli) y escribes su PIN de 4
+//     dígitos. El PIN se compara como hash (SHA-256 con sal por perfil) y solo
+//     decide qué perfil ves en este dispositivo; no es la seguridad de la base.
 
-import { Session, Finance } from './db.js';
-import { SESSION_KEY, SESSION_DAYS, PIN_SALT } from './config.js';
+import { Finance } from './db.js';
+import {
+  getAuthSession, signIn, signOut, sendPasswordReset, setNewPassword, cameFromRecovery,
+} from './supabase.js';
+import { readLock, isUnlocked, unlock, lock } from './pin-lock.js';
+import { PIN_DAYS, PIN_SALT } from './config.js';
 import { $, $$, html, raw, esc, toast } from './ui.js';
 
-let actual = null; // { token, profile }
+const PERFIL_CACHE = 'assuite:perfil';
+
+let actual = null; // { user, profile }
 
 /* ---------------- utilidades ---------------- */
 export async function hashPin(profileId, pin) {
@@ -23,31 +27,12 @@ export async function hashPin(profileId, pin) {
   return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-const leerToken = () => {
-  try { return localStorage.getItem(SESSION_KEY) || ''; } catch { return ''; }
+const leerPerfilCache = () => {
+  try { return JSON.parse(localStorage.getItem(PERFIL_CACHE) || 'null'); } catch { return null; }
 };
-const guardarToken = (t) => {
-  try { localStorage.setItem(SESSION_KEY, t); } catch { /* modo privado */ }
+const guardarPerfilCache = (p) => {
+  try { localStorage.setItem(PERFIL_CACHE, JSON.stringify(p)); } catch { /* noop */ }
 };
-const borrarToken = () => {
-  try { localStorage.removeItem(SESSION_KEY); } catch { /* noop */ }
-};
-
-/** Si llegamos desde otra app del Suite con #as=<token>, lo adoptamos. */
-function adoptarTokenDeLaUrl() {
-  const m = (location.hash || '').match(/[#&]as=([A-Za-z0-9-]{8,})/);
-  if (!m) return;
-  guardarToken(m[1]);
-  const limpio = location.hash.replace(/[#&]as=[A-Za-z0-9-]+/, '');
-  history.replaceState(null, '', location.pathname + location.search + (limpio || '#/'));
-}
-
-/** Enlace a otro sitio del Suite llevando la sesión puesta. */
-export function linkConSesion(url) {
-  const t = leerToken();
-  if (!url || !t) return url;
-  return url + (url.includes('#') ? '&' : '#') + 'as=' + encodeURIComponent(t);
-}
 
 export const sesion = () => actual;
 export const perfilActivo = () => actual?.profile || null;
@@ -56,19 +41,24 @@ export const perfilActivo = () => actual?.profile || null;
 export function actualizarPerfilActivo(patch) {
   if (!actual?.profile) return null;
   actual.profile = { ...actual.profile, ...patch };
-  try { localStorage.setItem('assuite:perfil', JSON.stringify(actual.profile)); } catch { /* noop */ }
+  guardarPerfilCache(actual.profile);
   return actual.profile;
 }
 
+/** Vuelve al selector de perfil + PIN sin cerrar la sesión de la cuenta. */
+export function cambiarPerfil() {
+  lock(localStorage);
+}
+
+/** Cierra la sesión de la cuenta (todos = en todos los dispositivos). */
 export async function cerrarSesion({ todos = false } = {}) {
-  const t = leerToken();
-  if (todos && actual?.profile) await Session.closeAll(actual.profile.id);
-  else await Session.close(t);
-  borrarToken();
+  lock(localStorage);
+  try { localStorage.removeItem(PERFIL_CACHE); } catch { /* noop */ }
+  try { await signOut(todos ? 'global' : 'local'); } catch { /* sin red: se borra igual en local */ }
   actual = null;
 }
 
-/** Cambia el PIN del perfil activo y cierra las demás sesiones. */
+/** Cambia el PIN del perfil activo. */
 export async function cambiarPin(profileId, pinNuevo) {
   const pin_hash = await hashPin(profileId, pinNuevo);
   await Finance.updateProfile(profileId, { pin_hash });
@@ -76,14 +66,41 @@ export async function cambiarPin(profileId, pinNuevo) {
   return pin_hash;
 }
 
-/* ---------------- pantalla de entrada ---------------- */
-const DIAS_TXT = `${SESSION_DAYS} días`;
+/* ---------------- pantallas de entrada ---------------- */
+const DIAS_TXT = `${PIN_DAYS} días`;
+
+function pintarLogin(box, msg = '') {
+  box.innerHTML = html`
+    <p class="gateStep">Entrar</p>
+    <h2 class="gateTitle">Inicia sesión</h2>
+    <p class="gateHint" id="gateMsg">${msg || 'Con tu correo y contraseña. Queda recordado en este dispositivo.'}</p>
+    <form id="gateLogin" class="gateForm" novalidate>
+      <div class="field"><label for="gateEmail">CORREO</label>
+        <input class="input" id="gateEmail" type="email" autocomplete="username" required></div>
+      <div class="field"><label for="gatePass">CONTRASEÑA</label>
+        <input class="input" id="gatePass" type="password" autocomplete="current-password" required></div>
+      <button class="btn btn--primary btn--block" type="submit">ENTRAR</button>
+      <button class="btn btn--sm gateKeySoft" type="button" data-act="reset">Olvidé mi contraseña</button>
+    </form>`;
+}
+
+function pintarNuevaClave(box) {
+  box.innerHTML = html`
+    <p class="gateStep">Recuperar acceso</p>
+    <h2 class="gateTitle">Nueva contraseña</h2>
+    <p class="gateHint" id="gateMsg">Mínimo 10 caracteres. Que no la uses en otro sitio.</p>
+    <form id="gateNewPass" class="gateForm" novalidate>
+      <div class="field"><label for="gateNew">CONTRASEÑA NUEVA</label>
+        <input class="input" id="gateNew" type="password" autocomplete="new-password" minlength="10" required></div>
+      <button class="btn btn--primary btn--block" type="submit">GUARDAR</button>
+    </form>`;
+}
 
 function pintarPerfiles(box, perfiles) {
   box.innerHTML = html`
     <p class="gateStep">Paso 1 de 2</p>
-    <h2 class="gateTitle">¿Quién eres?</h2>
-    <p class="gateHint">Tu sesión queda recordada ${DIAS_TXT} en este dispositivo.</p>
+    <h2 class="gateTitle">¿Qué perfil?</h2>
+    <p class="gateHint">El PIN queda recordado ${DIAS_TXT} en este dispositivo.</p>
     <div class="gateProfiles">
       ${raw(perfiles.map((p) => `
         <button class="gateProfile" type="button" data-pid="${esc(p.id)}">
@@ -91,7 +108,8 @@ function pintarPerfiles(box, perfiles) {
           <b>${esc(p.name)}</b>
           <small>${esc(p.account_label || 'Perfil del Suite')}</small>
         </button>`).join(''))}
-    </div>`;
+    </div>
+    <button class="btn btn--sm gateKeySoft" type="button" data-act="logout">Cerrar sesión de la cuenta</button>`;
 }
 
 function pintarPin(box, perfil) {
@@ -108,22 +126,24 @@ function pintarPin(box, perfil) {
     </div>`;
 }
 
+const mensaje = (texto) => { const m = $('#gateMsg'); if (m) m.textContent = texto; };
+
 /**
- * Muestra la pantalla de entrada y resuelve cuando hay sesión válida.
- * Devuelve { token, profile }.
+ * Muestra la pantalla de entrada y resuelve cuando hay sesión de cuenta
+ * y perfil desbloqueado. Devuelve { user, profile }.
  */
 export function requireSession() {
-  adoptarTokenDeLaUrl();
-
   return new Promise((resolve) => {
     const gate = $('#gate');
     const box = $('#gateBox');
+    let user = null;
     let perfiles = [];
     let elegido = null;
     let buffer = '';
 
-    const terminar = (token, profile) => {
-      actual = { token, profile };
+    const terminar = (profile) => {
+      actual = { user, profile };
+      guardarPerfilCache(profile);
       gate.classList.add('hide');
       resolve(actual);
     };
@@ -136,22 +156,25 @@ export function requireSession() {
       buffer = ''; pintarPuntos();
       gate.classList.add('is-wrong');
       setTimeout(() => gate.classList.remove('is-wrong'), 420);
-      const m = $('#gateMsg');
-      if (m) m.textContent = msg;
+      mensaje(msg);
     };
 
-    const validar = async () => {
+    const validarPin = async () => {
       const pin = buffer;
       buffer = ''; pintarPuntos();
-      const hash = await hashPin(elegido.id, pin);
-      if (hash !== elegido.pin_hash) return fallar('PIN incorrecto, intenta otra vez');
-      try {
-        const s = await Session.open(elegido.id, SESSION_DAYS, navigator.userAgent.slice(0, 120));
-        guardarToken(s.token);
-        terminar(s.token, elegido);
-      } catch {
-        fallar('No se pudo abrir la sesión. Revisa tu conexión.');
+      if (await hashPin(elegido.id, pin) !== elegido.pin_hash) return fallar('PIN incorrecto, intenta otra vez');
+      unlock(localStorage, elegido.id, PIN_DAYS);
+      terminar(elegido);
+    };
+
+    const elegirPerfil = (p) => {
+      elegido = p;
+      buffer = '';
+      if (!p.pin_hash) { // perfil sin PIN: no hay bloqueo que pedir
+        unlock(localStorage, p.id, PIN_DAYS);
+        return terminar(p);
       }
+      pintarPin(box, p);
     };
 
     const teclear = (k) => {
@@ -160,22 +183,78 @@ export function requireSession() {
       if (!/^\d$/.test(k) || buffer.length >= 4) return;
       buffer += k;
       pintarPuntos();
-      if (buffer.length === 4) setTimeout(validar, 110);
+      if (buffer.length === 4) setTimeout(validarPin, 110);
     };
 
-    box.addEventListener('click', (e) => {
-      const perfil = e.target.closest('[data-pid]');
-      if (perfil) {
-        elegido = perfiles.find((p) => p.id === perfil.dataset.pid);
-        buffer = '';
-        return pintarPin(box, elegido);
+    /* Ya con cuenta: cargar perfiles y pedir PIN si hace falta. */
+    const trasCuenta = async () => {
+      const candado = readLock(localStorage);
+      try { perfiles = await Finance.profiles(); }
+      catch {
+        // Sin conexión: se deja pasar con el perfil que este dispositivo ya desbloqueó.
+        const cache = leerPerfilCache();
+        if (cache && isUnlocked(candado) && candado.profileId === cache.id) return terminar(cache);
+        box.innerHTML = html`<p class="gateHint">No se pudieron cargar los perfiles. Revisa tu conexión y recarga.</p>`;
+        return;
       }
+      if (!perfiles.length) {
+        box.innerHTML = html`<p class="gateHint">Esta cuenta no tiene acceso a los datos del Suite.</p>`;
+        return;
+      }
+      if (isUnlocked(candado)) {
+        const p = perfiles.find((x) => x.id === candado.profileId);
+        if (p) return terminar(p);
+      }
+      if (perfiles.some((p) => !p.pin_hash)) toast('Hay perfiles sin PIN configurado', 'info');
+      pintarPerfiles(box, perfiles);
+    };
+
+    box.addEventListener('click', async (e) => {
+      const act = e.target.closest('[data-act]')?.dataset.act;
+      if (act === 'logout') { await cerrarSesion(); return pintarLogin(box); }
+      if (act === 'reset') {
+        const email = $('#gateEmail')?.value || '';
+        if (!email.includes('@')) return mensaje('Escribe tu correo arriba y vuelve a tocar "Olvidé mi contraseña".');
+        try { await sendPasswordReset(email); mensaje('Si el correo es correcto, te llegó un enlace para crear una contraseña nueva.'); }
+        catch { mensaje('No se pudo enviar el correo. Intenta en unos minutos.'); }
+        return;
+      }
+      const perfil = e.target.closest('[data-pid]');
+      if (perfil) return elegirPerfil(perfiles.find((p) => p.id === perfil.dataset.pid));
       const tecla = e.target.closest('[data-k]');
       if (tecla) teclear(tecla.dataset.k);
     });
 
+    box.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = e.target.querySelector('[type=submit]');
+      btn.disabled = true;
+      try {
+        if (e.target.id === 'gateLogin') {
+          const s = await signIn($('#gateEmail').value, $('#gatePass').value);
+          user = s.user;
+          box.innerHTML = '<p class="gateHint">Entrando…</p>';
+          await trasCuenta();
+        } else if (e.target.id === 'gateNewPass') {
+          const nueva = $('#gateNew').value;
+          if (nueva.length < 10) { mensaje('Usa al menos 10 caracteres.'); return; }
+          await setNewPassword(nueva);
+          toast('Contraseña actualizada');
+          await trasCuenta();
+        }
+      } catch (err) {
+        mensaje(/invalid login/i.test(err?.message || '')
+          ? 'Correo o contraseña incorrectos.'
+          : /pwned|leaked|weak/i.test(err?.message || '')
+            ? 'Esa contraseña aparece en filtraciones públicas. Usa otra.'
+            : 'No se pudo completar. Revisa tu conexión e intenta otra vez.');
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
     document.addEventListener('keydown', (e) => {
-      if (gate.classList.contains('hide') || !elegido) return;
+      if (gate.classList.contains('hide') || !elegido || !$('#gateKeys')) return;
       if (/^\d$/.test(e.key)) teclear(e.key);
       else if (e.key === 'Backspace') teclear('del');
     });
@@ -184,38 +263,17 @@ export function requireSession() {
       gate.classList.remove('hide');
       box.innerHTML = '<p class="gateHint">Conectando…</p>';
 
-      // 1) ¿Ya hay sesión vigente en este dispositivo?
-      const token = leerToken();
-      let sesionValida = null;
-      try { sesionValida = await Session.check(token); }
-      catch {
-        // Sin conexión: si el navegador recuerda el perfil, se deja pasar.
-        const cache = (() => { try { return JSON.parse(localStorage.getItem('assuite:perfil') || 'null'); } catch { return null; } })();
-        if (token && cache) return terminar(token, cache);
-        box.innerHTML = html`<p class="gateHint">Sin conexión. Conéctate una vez para entrar.</p>`;
-        return;
-      }
-
-      try { perfiles = await Finance.profiles(); }
-      catch { perfiles = []; }
-
-      if (sesionValida) {
-        const p = perfiles.find((x) => x.id === sesionValida.profile_id);
-        if (p) {
-          try { localStorage.setItem('assuite:perfil', JSON.stringify(p)); } catch { /* noop */ }
-          Session.touch(token);
-          return terminar(token, p);
+      const cuenta = await getAuthSession();
+      if (!cuenta) {
+        if (!navigator.onLine) {
+          box.innerHTML = html`<p class="gateHint">Sin conexión. Conéctate una vez para entrar.</p>`;
+          return;
         }
+        return pintarLogin(box);
       }
-
-      if (!perfiles.length) {
-        box.innerHTML = html`<p class="gateHint">No se pudieron cargar los perfiles. Recarga la página.</p>`;
-        return;
-      }
-      if (perfiles.some((p) => !p.pin_hash)) {
-        toast('Hay perfiles sin PIN configurado', 'info');
-      }
-      pintarPerfiles(box, perfiles);
+      user = cuenta.user;
+      if (cameFromRecovery) return pintarNuevaClave(box);
+      await trasCuenta();
     })();
   });
 }

@@ -233,6 +233,8 @@ main{padding-bottom:70px}
 .gateKeys button:active{transform:translate(3px,3px);box-shadow:0 0 0}
 .gateKeySoft{font-size:12px!important;font-weight:800!important;background:transparent!important;box-shadow:none!important;border-style:dashed!important}
 .gate.is-wrong .gateDots{animation:shake .4s}
+.gateForm{display:grid;gap:12px}
+.gateForm .field>label{color:#6a6a62}
 .whoBtn{display:inline-flex;align-items:center;gap:7px;min-height:42px;padding:8px 12px;font:800 12px var(--sans);background:var(--profile-accent,var(--cream));color:var(--ink);border:2px solid var(--ink);box-shadow:3px 3px 0 var(--ink);border-radius:999px}
 .whoBtn span{font-size:15px;line-height:1}
 .whoBtn b{max-width:9ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
