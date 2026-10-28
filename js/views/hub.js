@@ -5,10 +5,10 @@ import {
   buildDate, sheet, toast,
 } from '../ui.js';
 import { FRASES, SITIOS_EXTRA, APP_VERSION, BUILD_DATE } from '../config.js';
-import { linkConSesion, perfilActivo } from '../session.js';
+import { perfilActivo } from '../session.js';
 
-/* Reader Tracker vive en su propio sitio (mismo Supabase, mismo login PIN).
-   Aquí solo se enlaza con la sesión puesta para que no pida PIN otra vez. */
+/* Reader Tracker vive en su propio sitio (mismo Supabase, misma cuenta).
+   Cada sitio guarda su propia sesión: la primera vez se entra con el mismo correo. */
 const READER_URL = 'https://as-reader-as24-b7b9.vercel.app/';
 
 function fraseDelDia() {
@@ -74,7 +74,7 @@ function shell(nombre) {
           <div class="appOpen">ABRIR <b>↗</b></div>
         </a>
 
-        <a class="appCard tilt-a" href="${linkConSesion(READER_URL)}" target="_blank" rel="noopener" style="--accent:var(--wine)">
+        <a class="appCard tilt-a" href="${READER_URL}" target="_blank" rel="noopener" style="--accent:var(--wine)">
           <span class="appNum">#03</span>
           <div class="appIcon">R</div>
           <p class="appLabel">LEE · AVANZA · SUBE DE NIVEL</p>
@@ -109,10 +109,9 @@ function pintarExtra(root, links) {
   if (!box) return;
   box.innerHTML = SITIOS_EXTRA.map((s) => {
     const url = links[s.key] || '';
-    const destino = url ? linkConSesion(url) : '';
     const tag = url ? 'a' : 'button';
     const attrs = url
-      ? `href="${esc(destino)}" target="_blank" rel="noopener"`
+      ? `href="${esc(url)}" target="_blank" rel="noopener"`
       : 'type="button"';
     return `<${tag} class="extraCard ${url ? '' : 'is-empty'}" ${attrs}
               data-extra="${esc(s.key)}" style="--accent:${esc(s.accent)}">

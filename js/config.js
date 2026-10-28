@@ -5,14 +5,18 @@ export const SUPABASE_KEY = 'sb_publishable_XC5v-_UBfrsnbTLIJPqe6w_xXz3tCA6';
 export const TZ = 'America/Bogota';
 export const CURRENCY = 'COP';
 
-export const APP_VERSION = '3.7.4';
+export const APP_VERSION = '3.8.0';
 /* Respaldo por si el servidor no informa la fecha del archivo.
    La fecha real se lee del encabezado Last-Modified (ver ui.js → buildDate). */
 export const BUILD_DATE = '2026-10-06';
 
 /* Sesión compartida por todo el Suite */
-export const SESSION_KEY = 'assuite:token';
-export const SESSION_DAYS = 30;
+/* Sesión real: Supabase Auth (correo + contraseña), guardada en este dispositivo. */
+export const AUTH_STORAGE_KEY = 'assuite:auth';
+
+/* PIN = bloqueo rápido local por perfil (no es la seguridad de la base).
+   Tras escribirlo bien, no se vuelve a pedir en este dispositivo por PIN_DAYS. */
+export const PIN_DAYS = 30;
 export const PIN_SALT = 'as-suite';
 
 /* Acentos disponibles para personalizar Finanzas.
