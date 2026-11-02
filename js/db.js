@@ -1,30 +1,7 @@
 // AS HUB — capa de datos (Supabase + caché local)
-import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
+import { sb } from './supabase.js';
 
-// Se intenta más de un CDN: si uno falla, la app sigue funcionando.
-const CDNS = [
-  'https://esm.sh/@supabase/supabase-js@2.45.4',
-  'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm',
-  'https://unpkg.com/@supabase/supabase-js@2.45.4/dist/module/index.js',
-];
-
-async function loadCreateClient() {
-  let lastError;
-  for (const url of CDNS) {
-    try {
-      const mod = await import(/* @vite-ignore */ url);
-      if (mod?.createClient) return mod.createClient;
-    } catch (err) { lastError = err; }
-  }
-  throw lastError || new Error('No se pudo cargar la librería de datos');
-}
-
-const createClient = await loadCreateClient();
-
-export const sb = createClient(SUPABASE_URL, SUPABASE_KEY, {
-  auth: { persistSession: false },
-  realtime: { params: { eventsPerSecond: 5 } },
-});
+export { sb };
 
 /* ---------- caché local: la app abre al instante y sin conexión ---------- */
 const CACHE_PREFIX = 'ashub:cache:';
@@ -206,37 +183,6 @@ export const Finance = {
   async addMerchantRule(r) { return unwrap(await sb.from('finance_merchant_rules').insert(r).select().single()); },
   async updateMerchantRule(id, patch) { return unwrap(await sb.from('finance_merchant_rules').update(patch).eq('id', id).select().single()); },
   async removeMerchantRule(id) { return unwrap(await sb.from('finance_merchant_rules').delete().eq('id', id)); },
-};
-
-/* ---------- SESIÓN DEL SUITE ---------- */
-export const Session = {
-  async open(profileId, days, device) {
-    const token = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now());
-    const expires = new Date(Date.now() + days * 864e5).toISOString();
-    await unwrap(await sb.from('sessions').insert({
-      token, profile_id: profileId, expires_at: expires, device: device || '',
-    }).select().single());
-    return { token, expires_at: expires, profile_id: profileId };
-  },
-  /** Devuelve la sesión si sigue vigente; null si venció o no existe. */
-  async check(token) {
-    if (!token) return null;
-    const rows = unwrap(await sb.from('sessions').select('*')
-      .eq('token', token).gt('expires_at', new Date().toISOString()).limit(1));
-    return rows?.[0] || null;
-  },
-  async touch(token) {
-    try { await sb.from('sessions').update({ last_seen: new Date().toISOString() }).eq('token', token); }
-    catch { /* no es crítico */ }
-  },
-  async close(token) {
-    if (!token) return;
-    try { await sb.from('sessions').delete().eq('token', token); } catch { /* noop */ }
-  },
-  /** Cierra la sesión en todos los dispositivos de ese perfil. */
-  async closeAll(profileId) {
-    try { await sb.from('sessions').delete().eq('profile_id', profileId); } catch { /* noop */ }
-  },
 };
 
 /* ---------- AJUSTES SUELTOS DEL SUITE (suite_data) ---------- */

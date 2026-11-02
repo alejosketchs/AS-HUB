@@ -1381,7 +1381,7 @@ function accionMenu(m) {
   }
 
   if (m === 'salir') {
-    return confirmSheet('Cerrar sesión', 'Tendrás que volver a escribir tu PIN en este dispositivo.', async () => {
+    return confirmSheet('Cerrar sesión', 'Tendrás que volver a entrar con tu correo y contraseña en este dispositivo.', async () => {
       await cerrarSesion();
       location.reload();
     });

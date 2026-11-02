@@ -3,7 +3,7 @@ import { Finance } from './db.js';
 import { $, $$, sheet, toast, html, raw, esc } from './ui.js';
 import { ACCENTS } from './config.js';
 import {
-  perfilActivo, actualizarPerfilActivo, cambiarPin, hashPin, cerrarSesion,
+  perfilActivo, actualizarPerfilActivo, cambiarPin, hashPin, cerrarSesion, cambiarPerfil,
 } from './session.js';
 
 const THEME_KEY = 'assuite:theme';
@@ -166,7 +166,11 @@ export function openUserSettings({ onChange } = {}) {
           if (action === 'profile') profileEditor(onChange);
           if (action === 'pin') pinEditor(onChange);
           if (action === 'appearance') appearanceEditor(onChange);
-          if (action === 'switch' || action === 'logout') {
+          if (action === 'switch') {
+            cambiarPerfil();
+            location.reload();
+          }
+          if (action === 'logout') {
             await cerrarSesion();
             location.reload();
           }
