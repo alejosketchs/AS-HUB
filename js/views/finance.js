@@ -9,6 +9,10 @@ import { perfilActivo, hashPin, cambiarPin, cerrarSesion } from '../session.js';
 import { bindCOPInput, formatCOPInput, parseCOP } from '../cop-input.js';
 import { batchSkipReasons } from '../bancolombia-text.js';
 import { findAutomaticTwins, findDuplicatePairs } from '../tx-dupes.js';
+import {
+  withoutIgnored, totals as calcTotals,
+  isIncome, isExpense, isSaving, isWithdrawal, isReimbursable, isRealExpense, isVarTx,
+} from '../finance-totals.js';
 
 /* ============================ constantes ============================ */
 const TABS = [
@@ -66,7 +70,7 @@ let state = {
   year: 0, month: 0,
   weekOffset: 0,
   profiles: [], cats: [], subs: [], tx: [], budgets: [], goals: [], debts: [],
-  cardProfiles: [], inboxPending: [], merchantRules: [],
+  cardProfiles: [], inboxPending: [], merchantRules: [], changeReqs: [],
   loaded: false,
 };
 
@@ -158,30 +162,11 @@ function payerHistory() {
    - ahorro: sigue siendo mío, solo cambia de lugar (no es gasto)
    - reembolsable: salió de la cuenta pero vuelve (cuenta en saldo, no en presupuesto)
    - saldo: dinero en la cuenta ahora mismo
-   - dinero libre: saldo menos obligaciones, presupuesto protegido y deudas       */
-const isIncome = (t) => t.type === 'income';
-const isExpense = (t) => t.type === 'expense';
-const isSaving = (t) => t.type === 'saving';
-const isWithdrawal = (t) => t.type === 'withdrawal';
-const isReimbursable = (t) => isExpense(t) && !!t.reimbursable;
+   - dinero libre: saldo menos obligaciones, presupuesto protegido y deudas
+   - ignorado: se ve en la lista, pero no cuenta en ninguna suma (finance-totals.js) */
 const refundCatId = () => state.cats.find((c) => c.slug === 'refund')?.id || null;
 const isRefund = (t) => isIncome(t) && !!refundCatId() && t.category_id === refundCatId();
-const isRealExpense = (t) => isExpense(t) && !t.reimbursable;
-const isRealIncome = (t) => isIncome(t) && !isRefund(t);
-const isFixedTx = (t) => isRealExpense(t) && t.spend_type === 'fixed';
-const isVarTx = (t) => isRealExpense(t) && t.spend_type !== 'fixed';
-
-function totals(list) {
-  return {
-    income: sumBy(list.filter(isRealIncome), amt),
-    expense: sumBy(list.filter(isRealExpense), amt),
-    fixed: sumBy(list.filter(isFixedTx), amt),
-    variable: sumBy(list.filter(isVarTx), amt),
-    saving: sumBy(list.filter(isSaving), amt) - sumBy(list.filter(isWithdrawal), amt),
-    cashIn: sumBy(list.filter((t) => isIncome(t) || isWithdrawal(t)), amt),
-    cashOut: sumBy(list.filter((t) => isExpense(t) || isSaving(t)), amt),
-  };
-}
+const totals = (list) => calcTotals(list, { refundCatId: refundCatId() });
 
 /** Saldo disponible: saldo inicial más todo lo que entró menos todo lo que salió. */
 function saldo() {
@@ -354,13 +339,15 @@ function hormigaTx(list) {
 /* ============================ carga ============================ */
 async function loadAll({ silent = false } = {}) {
   const pid = state.profileId;
-  const [profiles, cats, subs, tx, budgets, goals, debts, cardProfiles, inboxPending, merchantRules] = await Promise.all([
+  const [profiles, cats, subs, tx, budgets, goals, debts, cardProfiles, inboxPending, merchantRules, changeReqs] = await Promise.all([
     Finance.profiles(), Finance.categories(), Finance.subcategories(),
     Finance.allTransactions(pid), Finance.budgets(pid), Finance.goals(pid), Finance.debts(pid),
     Finance.cardProfiles(), Finance.inboxPending(), Finance.merchantRules(pid),
+    // Si la tabla aún no existe (migración sin correr), Finanzas sigue funcionando.
+    Finance.changeRequestsPending(pid).catch(() => []),
   ]);
-  Object.assign(state, { profiles, cats, subs, tx, budgets, goals, debts, cardProfiles, inboxPending, merchantRules, loaded: true });
-  writeCache('fin:' + pid, { profiles, cats, subs, tx, budgets, goals, debts, cardProfiles, inboxPending, merchantRules });
+  Object.assign(state, { profiles, cats, subs, tx, budgets, goals, debts, cardProfiles, inboxPending, merchantRules, changeReqs, loaded: true });
+  writeCache('fin:' + pid, { profiles, cats, subs, tx, budgets, goals, debts, cardProfiles, inboxPending, merchantRules, changeReqs });
   aplicarAcento(profiles.find((x) => x.id === pid));
   if (!silent) toast('Finanzas al día');
   paint();
@@ -411,10 +398,12 @@ function rowHTML(t) {
   const sub = subById(t.subcategory_id);
   const goal = goalById(t.goal_id);
   const title = t.description || sub?.name || cat?.name || goal?.name || TX_LABEL[t.type] || 'Movimiento';
+  // Por tipo y no con isIncome()/isSaving(): esos ya dejan fuera los ignorados.
   let cls = 'finRow--out'; let sign = '− '; let icon = sub?.emoji || cat?.emoji || '💸';
-  if (isIncome(t)) { cls = 'finRow--in'; sign = '+ '; }
-  if (isSaving(t)) { cls = 'finRow--sav'; sign = '→ '; icon = '🐖'; }
-  if (isWithdrawal(t)) { cls = 'finRow--wd'; sign = '← '; icon = '🐖'; }
+  if (t.type === 'income') { cls = 'finRow--in'; sign = '+ '; }
+  if (t.type === 'saving') { cls = 'finRow--sav'; sign = '→ '; icon = '🐖'; }
+  if (t.type === 'withdrawal') { cls = 'finRow--wd'; sign = '← '; icon = '🐖'; }
+  if (t.ignored) cls += ' is-ignored';
   // Sin hora conocida (movimientos históricos importados) no se muestra nada.
   const meta = [
     goal ? `Meta: ${goal.name}` : null,
@@ -430,6 +419,7 @@ function rowHTML(t) {
   }
   const auto = t.source === 'automatico';
   if (auto) chip += '<em class="finChip finChip--auto">🤖 Automático</em>';
+  if (t.ignored) chip += '<em class="finChip finChip--ignored">Ignorado</em>';
   return html`
     <div class="finRow ${cls}" data-tx="${t.id}">
       <div class="finRowIcon">${icon}</div>
@@ -438,6 +428,7 @@ function rowHTML(t) {
       <div class="finIcons">
         ${auto ? H`<button type="button" data-act="tx-audit" aria-label="Ver correo original">🧾</button>
         <button type="button" data-act="tx-rule" aria-label="Categorizar siempre así">🏷️</button>` : ''}
+        ${t.ignored ? H`<button type="button" data-act="tx-unignore" aria-label="Volver a contar" title="Volver a contar en los totales">↺</button>` : ''}
         <button type="button" data-act="tx-edit" aria-label="Editar">✎</button>
         <button type="button" data-act="tx-del" aria-label="Eliminar">✕</button>
       </div>
@@ -957,6 +948,125 @@ function auditSheet(tx) {
   });
 }
 
+/* ============================ cambios propuestos (Money Admin) ============================ */
+function catLabel(catId, subId) {
+  const c = catById(catId); const s = subById(subId);
+  if (!c) return 'Sin categoría';
+  return `${c.emoji || ''} ${c.name}${s ? ' › ' + s.name : ''}`.trim();
+}
+
+/** Antes → después en palabras, a partir de lo que vio el bot (old_value) y lo que propone (new_value). */
+function changeWords(r) {
+  const o = r.old_value || {}; const v = r.new_value || {};
+  const countsText = (ignored) => (ignored ? 'Ignorado (no cuenta en los totales)' : 'Cuenta en los totales');
+  switch (r.change_type) {
+    case 'category': return { what: 'Categoría', before: catLabel(o.category_id, o.subcategory_id), after: catLabel(v.category_id, v.subcategory_id) };
+    case 'ignore': return { what: 'Ignorar', before: countsText(!!o.ignored), after: countsText(!!v.ignored) };
+    case 'amount': return { what: 'Monto', before: money(o.amount), after: money(v.amount) };
+    case 'description': return { what: 'Descripción', before: `“${o.description || ''}”`, after: `“${v.description || ''}”` };
+    default: return { what: r.change_type, before: '—', after: '—' };
+  }
+}
+
+/** La misma revisión que hace apply_change_request: si el movimiento ya no está como lo vio el bot, habrá conflicto. */
+function changeIsStale(r) {
+  const t = r.tx; const o = r.old_value || {};
+  if (!t) return true;
+  const same = (a, b) => (a ?? null) === (b ?? null);
+  switch (r.change_type) {
+    case 'category': return !same(o.category_id, t.category_id) || !same(o.subcategory_id, t.subcategory_id);
+    case 'ignore': return !!o.ignored !== !!t.ignored;
+    case 'amount': return n(o.amount) !== n(t.amount);
+    case 'description': return !same(o.description, t.description);
+    default: return false;
+  }
+}
+
+function changeCardHTML(r) {
+  const t = r.tx || {};
+  const w = changeWords(r);
+  return html`
+    <article class="finChange" data-change="${r.id}">
+      <div class="finChangeTx">
+        <span><b>${t.description || TX_LABEL[t.type] || 'Movimiento'}</b>
+          <small>${t.transaction_date ? `${fmtLongDay(t.transaction_date)} de ${t.transaction_date.slice(0, 4)}` : ''} · ${TX_LABEL[t.type] || ''}</small></span>
+        <b class="finChangeAmt">${t.type === 'income' ? '+ ' : '− '}${money(t.amount)}</b>
+      </div>
+      <p class="finChangeDiff"><span class="finTag">${w.what}</span> <s>${w.before}</s> → <b>${w.after}</b></p>
+      ${r.reason ? H`<p class="finChangeWhy">${r.reason}</p>` : ''}
+      ${changeIsStale(r) ? H`<small class="finMissing">⚠ El movimiento cambió desde que se propuso: al aprobar quedará en conflicto y no se tocará.</small>` : ''}
+      ${r.change_type === 'category' ? H`<label class="finChangeRule"><input type="checkbox" data-f="rule" ${r.save_merchant_rule ? 'checked' : ''}> Recordar para este comercio</label>` : ''}
+      <div class="finChangeActions">
+        <button class="finBtn finBtn--sm" type="button" data-act="chg-apply">✓ Aprobar</button>
+        <button class="finBtn finBtn--sm finBtn--plain" type="button" data-act="chg-reject">Rechazar</button>
+      </div>
+    </article>`;
+}
+
+function changesBodyHTML() {
+  const list = state.changeReqs;
+  return html`
+    <p class="sheetText">Money Admin propone corregir estos movimientos. Nada cambia hasta que lo apruebes.</p>
+    ${list.length > 1 ? H`<button class="finBtn finBtn--sm" type="button" data-act="chg-apply-all">✓ Aprobar todo (${list.length})</button>` : ''}
+    <div class="finChanges">${list.length ? raw(list.map(changeCardHTML).join(''))
+    : H`<div class="finEmpty">Sin cambios pendientes 🎉</div>`}</div>`;
+}
+
+/** Casilla "Recordar para este comercio" de la tarjeta (null si no es de categoría). */
+function ruleChoice(card) {
+  const box = card?.querySelector('[data-f="rule"]');
+  return box ? box.checked : null;
+}
+
+function changesSheet() {
+  sheet({
+    title: `Cambios propuestos (${state.changeReqs.length})`,
+    body: changesBodyHTML(),
+    onOpen: ({ root: r }) => {
+      const refresh = async () => {
+        await loadAll({ silent: true });
+        $('.sheetBody', r).innerHTML = changesBodyHTML();
+        $('.sheetHead h3', r).textContent = `Cambios propuestos (${state.changeReqs.length})`;
+      };
+      let busy = false;
+      r.addEventListener('click', async (e) => {
+        const btn = e.target.closest('[data-act]');
+        if (!btn || busy) return;
+        const act = btn.dataset.act;
+        if (!['chg-apply', 'chg-reject', 'chg-apply-all'].includes(act)) return;
+        busy = true;
+        try {
+          if (act === 'chg-apply-all') {
+            let applied = 0; let conflicts = 0; let failed = 0;
+            for (const card of r.querySelectorAll('[data-change]')) {
+              try {
+                const s = await Finance.applyChangeRequest(card.dataset.change, ruleChoice(card));
+                if (s === 'applied') applied += 1;
+                else if (s === 'conflict') conflicts += 1;
+              } catch { failed += 1; }
+            }
+            toast(`${applied} aplicados${conflicts ? ` · ${conflicts} en conflicto (no se tocaron)` : ''}${failed ? ` · ${failed} con error` : ''}`, failed ? 'err' : undefined);
+          } else {
+            const card = btn.closest('[data-change]');
+            if (act === 'chg-reject') {
+              await Finance.rejectChangeRequest(card.dataset.change);
+              toast('Cambio rechazado');
+            } else if (await Finance.applyChangeRequest(card.dataset.change, ruleChoice(card)) === 'conflict') {
+              toast('El movimiento cambió desde la propuesta: quedó en conflicto y no se tocó', 'err');
+            } else {
+              toast('Cambio aplicado');
+            }
+          }
+          await refresh();
+        } catch {
+          toast('No se pudo guardar; el movimiento no cambió', 'err');
+        } finally { busy = false; }
+      });
+    },
+    actions: [{ label: 'Cerrar', onClick: ({ close }) => close() }],
+  });
+}
+
 /* ============================ vista: DEUDAS ============================ */
 function debtHTML(d) {
   const paid = d.status === 'paid';
@@ -1213,6 +1323,7 @@ function paint() {
         </div>
         <div class="finTopRight">
           <div class="finTopBtns">
+            ${state.changeReqs.length ? H`<button class="finBtn finBtn--plain finBtn--alert" type="button" data-act="changes">📝 Cambios propuestos (${state.changeReqs.length})</button>` : ''}
             ${state.inboxPending.length ? H`<button class="finBtn finBtn--plain finBtn--alert" type="button" data-act="inbox">📥 Bandeja (${state.inboxPending.length})</button>` : ''}
             ${(dupeCount || dupeHidden) ? H`<button class="finBtn finBtn--plain" type="button" data-act="dupes">${dupeCount ? `Posibles duplicados (${dupeCount})` : 'Posibles duplicados'}</button>` : ''}
             <button class="finBtn finBtn--plain" type="button" data-act="tools">Exportar</button>
@@ -1271,7 +1382,8 @@ function exportarPDF(rango) {
     titulo = `Año ${y}`;
   }
 
-  lista = [...lista].sort((a, b) => (a.transaction_date < b.transaction_date ? 1 : -1));
+  // Los ignorados no salen en el informe.
+  lista = withoutIgnored(lista).sort((a, b) => (a.transaction_date < b.transaction_date ? 1 : -1));
   const t = totals(lista);
 
   const filas = lista.map((x) => {
@@ -1476,7 +1588,7 @@ function clearDismissedDupes() {
 
 function visibleDupes() {
   const hidden = readDismissedDupes();
-  return findDuplicatePairs(state.tx).filter((p) => !hidden.has(`${p.manual.id}:${p.automatic.id}`));
+  return findDuplicatePairs(withoutIgnored(state.tx)).filter((p) => !hidden.has(`${p.manual.id}:${p.automatic.id}`));
 }
 
 function txWhen(t) {
@@ -1506,7 +1618,7 @@ async function linkOntoAutomatic(auto, payload, { description = true, category =
  * Devuelve true si abrió la pregunta (el guardado normal no debe seguir).
  */
 function interceptManualDuplicate(payload, { close, okText }) {
-  const twins = findAutomaticTwins(state.tx, payload);
+  const twins = findAutomaticTwins(withoutIgnored(state.tx), payload);
   if (!twins.length) return false;
   close();
   setTimeout(() => sameMovementSheet(payload, twins, okText), 220);
@@ -2211,6 +2323,7 @@ function wire() {
     if (act === 'free-detail') return freeSheet();
     if (act === 'reconcile') return reconcileSheet();
     if (act === 'inbox') return inboxSheet();
+    if (act === 'changes') return changesSheet();
     if (act === 'dupes') return dupesSheet();
 
     if (act === 'base') {
@@ -2232,6 +2345,15 @@ function wire() {
 
     /* --- movimientos --- */
     if (act === 'tx-new') return txSheet(null);
+    if (act === 'tx-unignore') {
+      const id = btn.closest('[data-tx]').dataset.tx;
+      try {
+        await Finance.updateTransaction(id, { ignored: false });
+        await loadAll({ silent: true });
+        toast('Vuelve a contar en los totales');
+      } catch { toast('No se pudo actualizar', 'err'); }
+      return;
+    }
     if (act === 'tx-edit' || act === 'tx-del' || act === 'tx-audit') {
       const id = btn.closest('[data-tx]').dataset.tx;
       const tx = state.tx.find((t) => t.id === id);
@@ -2430,7 +2552,7 @@ export async function render(container) {
 
   watch('finance', ['finance_transactions', 'budgets', 'savings_goals', 'debts',
     'finance_categories', 'finance_subcategories', 'profiles',
-    'finance_card_profiles', 'finance_email_inbox', 'finance_merchant_rules'],
+    'finance_card_profiles', 'finance_email_inbox', 'finance_merchant_rules', 'finance_change_requests'],
   () => loadAll({ silent: true }));
 }
 

@@ -23,7 +23,7 @@ const TABLES = {
   finance_categories: 'id', finance_subcategories: 'id', finance_transactions: 'id',
   budgets: 'id', budget_checks: 'id', debts: 'id', savings_goals: 'id',
   finance_card_profiles: 'id', finance_email_inbox: 'id', finance_merchant_rules: 'id',
-  finance_profile_data: 'profile_id',
+  finance_profile_data: 'profile_id', finance_change_requests: 'id',
   reader_users: 'id', reader_books: 'id', reader_logs: 'id', reader_unlocks: 'id',
   reader_glossary: 'id', reader_quotes: 'id', reader_push_subs: 'id', reader_push_sent: 'id',
 };
@@ -35,6 +35,8 @@ const RPCS = {
   finance_inbox_apply_batch: { p_inbox_ids: [] },
   finance_inbox_apply: { p_inbox_id: '00000000-0000-0000-0000-000000000000', p_tx: {} },
   finance_email_inbox_on_tx_delete: {},
+  apply_change_request: { request_id: '00000000-0000-0000-0000-000000000000' },
+  reject_change_request: { request_id: '00000000-0000-0000-0000-000000000000' },
 };
 
 const REST = `${SUPABASE_URL}/rest/v1`;
