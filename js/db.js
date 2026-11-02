@@ -183,6 +183,20 @@ export const Finance = {
   async addMerchantRule(r) { return unwrap(await sb.from('finance_merchant_rules').insert(r).select().single()); },
   async updateMerchantRule(id, patch) { return unwrap(await sb.from('finance_merchant_rules').update(patch).eq('id', id).select().single()); },
   async removeMerchantRule(id) { return unwrap(await sb.from('finance_merchant_rules').delete().eq('id', id)); },
+
+  /* Cambios que propone Money Admin sobre movimientos ya importados (docs/money-admin-cambios.md).
+     Trae el movimiento embebido; se filtra por su perfil porque el bot puede no llenar profile_id. */
+  async changeRequestsPending(profileId) {
+    return unwrap(await sb.from('finance_change_requests')
+      .select('*, tx:finance_transactions!inner(*)')
+      .eq('status', 'pending').eq('tx.profile_id', profileId)
+      .order('created_at', { ascending: true }));
+  },
+  /* Devuelve 'applied' o 'conflict'. saveRule: casilla "Recordar para este comercio" (null = lo que propuso el bot). */
+  async applyChangeRequest(id, saveRule = null) {
+    return unwrap(await sb.rpc('apply_change_request', { request_id: id, p_save_rule: saveRule }));
+  },
+  async rejectChangeRequest(id) { return unwrap(await sb.rpc('reject_change_request', { request_id: id })); },
 };
 
 /* ---------- AJUSTES SUELTOS DEL SUITE (suite_data) ---------- */
