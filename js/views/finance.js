@@ -7,6 +7,8 @@ import {
 import { TZ, ACCENTS, APP_VERSION } from '../config.js';
 import { perfilActivo, hashPin, cambiarPin, cerrarSesion } from '../session.js';
 import { bindCOPInput, formatCOPInput, parseCOP } from '../cop-input.js';
+import { batchSkipReasons } from '../bancolombia-text.js';
+import { findAutomaticTwins, findDuplicatePairs } from '../tx-dupes.js';
 
 /* ============================ constantes ============================ */
 const TABS = [
@@ -73,6 +75,11 @@ let state = {
 const H = (strings, ...values) => raw(html(strings, ...values));
 
 const n = (v) => Number(v) || 0;
+function asBool(v) {
+  if (v === true || v === 1) return true;
+  if (typeof v === 'string') return ['true', '1', 'si', 'sí', 'yes'].includes(v.trim().toLowerCase());
+  return false;
+}
 const amt = (x) => n(x.amount);
 const dateAt = (iso) => new Date(iso + 'T12:00:00');
 const dayNum = (iso) => Number(iso.slice(8, 10));
@@ -831,25 +838,39 @@ function cardProfileSheet(c) {
 }
 
 /* ============================ bandeja de revisión ============================ */
-/** Qué le falta a una fila de la bandeja para poder aprobarse en lote (vacío = lista). */
+const INBOX_GAP_LABEL = {
+  perfil: 'perfil',
+  monto: 'monto',
+  categoría: 'categoría',
+  tipo: 'tipo',
+  pago_tarjeta_propia: 'pago de tu tarjeta (no entra solo)',
+  ingreso_tarjeta_credito: 'ingreso de la tarjeta de crédito (no entra solo)',
+  pago_desde_8213: 'pago desde ahorros a la tarjeta (no entra solo)',
+  reverso: 'reverso o devolución (no entra solo)',
+};
+const INBOX_BLOCKS = new Set(['pago_tarjeta_propia', 'ingreso_tarjeta_credito', 'pago_desde_8213', 'reverso']);
+
+function inboxCodes(item) {
+  return batchSkipReasons(item).filter((k) => k !== 'estado');
+}
+
+/** Qué le falta a una fila, o por qué no entra en "Aprobar todas" (vacío = lista). */
 function inboxMissing(item) {
-  const p = item.parsed;
-  const missing = [];
-  if (!item.profile_id) missing.push('perfil');
-  if (!(n(p?.amount) > 0)) missing.push('monto');
-  if (!p?.category_id) missing.push('categoría');
-  if (p && !['income', 'expense'].includes(p.type)) missing.push('tipo');
-  return missing;
+  return inboxCodes(item).map((k) => INBOX_GAP_LABEL[k] || k);
 }
 
 function inboxItemHTML(item) {
   const p = item.parsed;
-  const guess = p ? `${p.type === 'income' ? '+' : '−'} ${money(p.amount)} · ${p.description}${p.last4 ? ' · ••••' + p.last4 : ''}`
-    : 'No se reconoció el formato del correo';
+  const codes = inboxCodes(item);
+  const blocked = codes.some((k) => INBOX_BLOCKS.has(k));
+  const missing = codes.filter((k) => !INBOX_BLOCKS.has(k)).map((k) => INBOX_GAP_LABEL[k] || k);
+  const guess = blocked
+    ? `No entra solo${p?.amount ? `: ${p.type === 'income' ? '+' : '−'} ${money(p.amount)}${p.description ? ' · ' + p.description : ''}` : ''}. Revísalo y, si corresponde, complétalo a mano.`
+    : (p ? `${p.type === 'income' ? '+' : '−'} ${money(p.amount)} · ${p.description}${p.last4 ? ' · ••••' + p.last4 : ''}`
+      : 'No se reconoció el formato del correo');
   const cat = p?.category_name ? ` · ${p.category_name}${p.subcategory_name ? ' › ' + p.subcategory_name : ''}` : '';
-  const missing = inboxMissing(item);
   return html`
-    <div class="finLine ${missing.length ? 'is-incomplete' : ''}" data-inbox="${item.id}" style="flex-wrap:wrap">
+    <div class="finLine ${codes.length ? 'is-incomplete' : ''}" data-inbox="${item.id}" style="flex-wrap:wrap">
       <span><b>${item.subject || 'Correo de Bancolombia'}</b><small>${timeOf(item.received_at) ? dateAt(dayOf(item.received_at)).toLocaleDateString('es-CO') + ' · ' : ''}${guess}${cat}</small>
         ${missing.length ? H`<small class="finMissing">Falta: ${missing.join(', ')}</small>` : ''}</span>
       <span class="finIcons" style="flex:none">
@@ -905,9 +926,9 @@ function inboxApproveAllSheet(ready) {
   sheet({
     title: 'Aprobar todas',
     body: html`
-      <p class="sheetText">Se crearán <b>${ready.length}</b> movimientos con la categoría que trae cada correo.</p>
+      <p class="sheetText">Se van a aprobar <b>${ready.length}</b> movimientos, por <b>${money(expense + income)}</b> en total.</p>
       <p class="sheetText">${expense ? `Gastos: ${money(expense)}` : ''}${expense && income ? ' · ' : ''}${income ? `Ingresos: ${money(income)}` : ''}</p>
-      ${pending ? H`<p class="sheetText">${pending} sin perfil, monto o categoría se quedan pendientes.</p>` : ''}`,
+      ${pending ? H`<p class="sheetText">${pending} se quedan pendientes y siguen resaltados.</p>` : ''}`,
     actions: [
       { label: 'Cancelar', onClick: ({ close }) => close() },
       {
@@ -1178,6 +1199,8 @@ const VIEWS = {
 function paint() {
   if (!root) return;
   const p = profile();
+  const dupeCount = visibleDupes().length;
+  const dupeHidden = readDismissedDupes().size;
   root.innerHTML = html`
     <section class="fin">
       <header class="finTop">
@@ -1191,6 +1214,7 @@ function paint() {
         <div class="finTopRight">
           <div class="finTopBtns">
             ${state.inboxPending.length ? H`<button class="finBtn finBtn--plain finBtn--alert" type="button" data-act="inbox">📥 Bandeja (${state.inboxPending.length})</button>` : ''}
+            ${(dupeCount || dupeHidden) ? H`<button class="finBtn finBtn--plain" type="button" data-act="dupes">${dupeCount ? `Posibles duplicados (${dupeCount})` : 'Posibles duplicados'}</button>` : ''}
             <button class="finBtn finBtn--plain" type="button" data-act="tools">Exportar</button>
           </div>
           <small>✓ Sincronizado · PC + celular</small>
@@ -1429,18 +1453,230 @@ function spendTypeFor(type, categoryId, subcategoryId) {
   return 'variable';
 }
 
+/* ============================ manual vs automático ============================ */
+const DUPE_DISMISS = 'ashub:dupe-dismiss:';
+
+function readDismissedDupes() {
+  try {
+    const raw = localStorage.getItem(DUPE_DISMISS + state.profileId);
+    const list = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(list) ? list : []);
+  } catch { return new Set(); }
+}
+
+function dismissDupe(pair) {
+  const set = readDismissedDupes();
+  set.add(`${pair.manual.id}:${pair.automatic.id}`);
+  try { localStorage.setItem(DUPE_DISMISS + state.profileId, JSON.stringify([...set])); } catch { /* cuota */ }
+}
+
+function clearDismissedDupes() {
+  try { localStorage.removeItem(DUPE_DISMISS + state.profileId); } catch { /* noop */ }
+}
+
+function visibleDupes() {
+  const hidden = readDismissedDupes();
+  return findDuplicatePairs(state.tx).filter((p) => !hidden.has(`${p.manual.id}:${p.automatic.id}`));
+}
+
+function txWhen(t) {
+  return `${fmtLongDay(t.transaction_date)} · ${money(t.amount)} · ${TX_LABEL[t.type] || t.type}`;
+}
+
+/** Copia al automático lo que la persona anotó, sin tocar hora, monto ni origen. */
+async function linkOntoAutomatic(auto, payload, { description = true, category = true } = {}) {
+  const patch = {};
+  const desc = (payload.description || '').trim();
+  if (description && desc) patch.description = desc;
+  if (category && payload.category_id) {
+    patch.category_id = payload.category_id;
+    patch.subcategory_id = payload.subcategory_id || null;
+    patch.spend_type = payload.spend_type || spendTypeFor(payload.type, payload.category_id, payload.subcategory_id);
+  }
+  if (payload.type === 'expense' && category) {
+    patch.reimbursable = !!payload.reimbursable;
+    patch.reimburse_by = payload.reimbursable ? (payload.reimburse_by || '') : '';
+    if (!payload.reimbursable) { patch.reimbursed_at = null; patch.reimbursement_id = null; }
+  }
+  if (Object.keys(patch).length) await Finance.updateTransaction(auto.id, patch);
+}
+
+/**
+ * Si ya hay un automático parecido, pregunta antes de crear otro.
+ * Devuelve true si abrió la pregunta (el guardado normal no debe seguir).
+ */
+function interceptManualDuplicate(payload, { close, okText }) {
+  const twins = findAutomaticTwins(state.tx, payload);
+  if (!twins.length) return false;
+  close();
+  setTimeout(() => sameMovementSheet(payload, twins, okText), 220);
+  return true;
+}
+
+function sameMovementSheet(payload, twins, okText) {
+  const rows = twins.map((t) => html`
+    <div class="finDupe" data-twin="${t.id}">
+      <div>
+        <b>${t.description || 'Sin descripción'}</b>
+        <small>Automático · ${txWhen(t)}${catById(t.category_id) ? ' · ' + catById(t.category_id).name : ''}</small>
+      </div>
+      <div class="finDupeActs">
+        <button class="finBtn finBtn--sm" type="button" data-link="${t.id}">Sí, es este</button>
+      </div>
+    </div>`).join('');
+  sheet({
+    title: '¿Es este mismo?',
+    body: html`
+      <p class="sheetText">Ya hay un movimiento automático con el mismo valor, el mismo tipo y a lo sumo un día de diferencia. Si es el mismo, se liga y no queda dos veces. El del banco conserva la hora de la alerta.</p>
+      <div class="finLines">${raw(rows)}</div>`,
+    onOpen: ({ root: r, close }) => {
+      r.addEventListener('click', async (e) => {
+        const btn = e.target.closest('[data-link]');
+        if (!btn) return;
+        const auto = twins.find((t) => t.id === btn.dataset.link);
+        if (!auto) return;
+        btn.disabled = true;
+        try {
+          await linkOntoAutomatic(auto, payload);
+          close();
+          await loadAll({ silent: true });
+          toast('Ligado al movimiento automático, sin duplicar');
+        } catch { btn.disabled = false; toast('No se pudo ligar', 'err'); }
+      });
+    },
+    actions: [
+      { label: 'Descartar', onClick: ({ close }) => { close(); toast('No se guardó'); } },
+      {
+        label: 'No, es otro', onClick: async ({ close }) => {
+          try {
+            await Finance.addTransaction(payload);
+            await applyGoal(payload.goal_id, goalDelta(payload));
+            close();
+            await loadAll({ silent: true });
+            toast(okText);
+          } catch { toast('No se pudo guardar', 'err'); }
+        },
+      },
+    ],
+  });
+}
+
+function dupePairHTML(pair) {
+  const catOf = (t) => {
+    const c = catById(t.category_id);
+    const s = subById(t.subcategory_id);
+    return [c?.name, s?.name].filter(Boolean).join(' › ');
+  };
+  return html`
+    <article class="finDupe" data-pair="${pair.manual.id}:${pair.automatic.id}">
+      <div>
+        <b>Del banco: ${pair.automatic.description || 'Sin descripción'}</b>
+        <small>${txWhen(pair.automatic)}${catOf(pair.automatic) ? ' · ' + catOf(pair.automatic) : ''}</small>
+      </div>
+      <div>
+        <b>Anotado a mano: ${pair.manual.description || 'Sin descripción'}</b>
+        <small>${txWhen(pair.manual)}${catOf(pair.manual) ? ' · ' + catOf(pair.manual) : ''}${pair.days ? ' · ' + pair.days + ' día de diferencia' : ''}</small>
+      </div>
+      <div class="finDupeActs">
+        <button class="finBtn finBtn--sm" type="button" data-dupe="keep-auto">Dejar el del banco</button>
+        <button class="finBtn finBtn--sm finBtn--plain" type="button" data-dupe="different">No son el mismo</button>
+      </div>
+    </article>`;
+}
+
+function keepAutomaticSheet(pair) {
+  const manualDesc = (pair.manual.description || '').trim();
+  sheet({
+    title: 'Dejar el del banco',
+    body: html`
+      <p class="sheetText">Se borra solo el que anotaste a mano (<b>${pair.manual.description || 'sin descripción'}</b>, ${money(pair.manual.amount)}). El del correo se queda, con la hora de la alerta.</p>
+      ${manualDesc || pair.manual.category_id ? H`<label class="finCheckbox">
+        <input type="checkbox" data-f="carry">
+        <span>Pasar al del banco la categoría y la descripción que anoté</span>
+      </label>` : ''}`,
+    onOpen: ({ root: r, close }) => {
+      r.__save = async () => {
+        const carry = !!$('[data-f="carry"]', r)?.checked;
+        try {
+          if (carry) {
+            await linkOntoAutomatic(pair.automatic, {
+              description: pair.manual.description,
+              category_id: pair.manual.category_id,
+              subcategory_id: pair.manual.subcategory_id,
+              spend_type: pair.manual.spend_type,
+              type: pair.manual.type,
+              reimbursable: pair.manual.reimbursable,
+              reimburse_by: pair.manual.reimburse_by,
+            });
+          }
+          await Finance.removeTransaction(pair.manual.id);
+          await applyGoal(pair.manual.goal_id, -goalDelta(pair.manual));
+          close();
+          await loadAll({ silent: true });
+          toast('Quedó el movimiento del banco');
+          if (visibleDupes().length) setTimeout(dupesSheet, 220);
+        } catch { toast('No se pudo actualizar', 'err'); }
+      };
+    },
+    actions: [
+      { label: 'Cancelar', onClick: ({ close }) => { close(); setTimeout(dupesSheet, 220); } },
+      { label: 'Sí, borrar el manual', variant: 'danger', onClick: ({ root: r }) => r.__save?.() },
+    ],
+  });
+}
+
+function dupesSheet() {
+  const pairs = visibleDupes();
+  const hidden = readDismissedDupes().size;
+  sheet({
+    title: 'Posibles duplicados',
+    body: html`
+      <p class="sheetText">Uno lo anotaste tú y el otro entró del correo del banco, con el mismo valor y a lo sumo un día de diferencia. No borré ninguno. Si confirmas, se quita el manual y se queda el del banco.</p>
+      ${pairs.length ? raw(pairs.map(dupePairHTML).join('')) : H`<div class="finEmpty">Nada pendiente por revisar.</div>`}
+      ${hidden ? H`<p class="finNote"><button class="finLink" type="button" data-dupe="reset">Volver a mostrar los que marqué como distintos (${hidden})</button></p>` : ''}`,
+    onOpen: ({ root: r, close }) => {
+      r.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-dupe]');
+        if (!btn) return;
+        if (btn.dataset.dupe === 'reset') {
+          clearDismissedDupes();
+          close();
+          setTimeout(dupesSheet, 220);
+          return;
+        }
+        const key = btn.closest('[data-pair]')?.dataset.pair;
+        const pair = pairs.find((p) => `${p.manual.id}:${p.automatic.id}` === key);
+        if (!pair) return;
+        if (btn.dataset.dupe === 'different') {
+          dismissDupe(pair);
+          close();
+          toast('Listo: ese par se queda como está');
+          if (visibleDupes().length || readDismissedDupes().size) setTimeout(dupesSheet, 220);
+          return;
+        }
+        if (btn.dataset.dupe === 'keep-auto') {
+          close();
+          setTimeout(() => keepAutomaticSheet(pair), 220);
+        }
+      });
+    },
+    actions: [{ label: 'Cerrar', onClick: ({ close }) => close() }],
+  });
+}
+
 function txSheet(tx, inboxItem) {
   const editing = !!tx;
   const guess = inboxItem?.parsed;
+  const alertDay = inboxItem ? dayOf(inboxItem.received_at) : '';
   const data = {
     type: tx?.type || guess?.type || 'expense',
     amount: tx ? n(tx.amount) : (guess?.amount || ''),
-    date: tx?.transaction_date || (inboxItem ? dayOf(inboxItem.received_at) : todayISO()),
+    date: tx?.transaction_date || alertDay || todayISO(),
     category_id: tx?.category_id || guess?.category_id || '',
     subcategory_id: tx?.subcategory_id || guess?.subcategory_id || '',
     goal_id: tx?.goal_id || state.goals[0]?.id || '',
     description: tx?.description || guess?.description || '',
-    reimbursable: tx ? !!tx.reimbursable : !!guess?.reimbursable,
+    reimbursable: tx ? !!tx.reimbursable : asBool(guess?.reimbursable),
     reimburse_by: tx?.reimburse_by || guess?.reimburse_by || '',
   };
   const seg = data.type === 'income' ? 'income' : (data.type === 'expense' ? 'expense' : 'saving');
@@ -1449,7 +1685,10 @@ function txSheet(tx, inboxItem) {
 
   const catOpts = (type) => {
     const kinds = type === 'income' ? ['income'] : ['fixed', 'variable'];
-    return state.cats.filter((c) => kinds.includes(c.kind));
+    const list = state.cats.filter((c) => kinds.includes(c.kind));
+    const current = data.category_id && catById(data.category_id);
+    if (current && !list.some((c) => c.id === current.id)) list.unshift(current);
+    return list;
   };
 
   sheet({
@@ -1457,7 +1696,9 @@ function txSheet(tx, inboxItem) {
     body: html`
       <div class="finForm">
         ${inboxItem ? H`<p class="sheetText">Del correo: <b>${inboxItem.subject || 'alerta de Bancolombia'}</b>.
-          Revisa los datos antes de guardar${!guess ? ' (no se reconoció el formato, complétalos a mano)' : ''}.</p>` : ''}
+          La fecha queda en ${alertDay || 'el día de la alerta'}${timeOf(inboxItem.received_at) ? ' y la hora a las ' + timeOf(inboxItem.received_at) : ''} (Bogotá), no a la hora en que apruebas.
+          Revisa categoría y reembolso antes de guardar${!guess ? ' (no se reconoció el formato, complétalos a mano)' : ''}.</p>
+          ${guess?.note ? H`<p class="sheetText">Nota del correo: ${guess.note}</p>` : ''}` : ''}
         <div class="finSeg" data-seg="type">
           <button type="button" data-v="expense" aria-pressed="${segType === 'expense'}">Gasto</button>
           <button type="button" data-v="income" aria-pressed="${segType === 'income'}">Ingreso</button>
@@ -1468,7 +1709,7 @@ function txSheet(tx, inboxItem) {
           <button type="button" data-v="withdrawal" aria-pressed="${savingDir === 'withdrawal'}">← Retirar de la meta</button>
         </div>
         ${raw(field('Monto', `<input type="text" inputmode="numeric" autocomplete="off" data-f="amount" value="${formatCOPInput(data.amount)}" placeholder="$0">`))}
-        ${raw(field('Fecha', `<input type="date" data-f="date" value="${data.date}">`))}
+        ${raw(field('Fecha', `<input type="date" data-f="date" value="${data.date}"${inboxItem ? ' readonly' : ''}>`))}
         <div data-block="goal" ${segType === 'saving' ? '' : 'hidden'}>
           ${raw(field('Meta de ahorro', `<select data-f="goal_id">${
   optionList(state.goals, data.goal_id, (g) => ({ value: g.id, label: `🎯 ${g.name} · ${money(g.current)} / ${money(g.target)}` }))}</select>`))}
@@ -1586,10 +1827,10 @@ function txSheet(tx, inboxItem) {
         const subId = saving ? null : (get('subcategory_id').value || null);
         const reimbursable = type === 'expense' && get('reimbursable').checked;
         const payload = {
-          profile_id: state.profileId,
+          profile_id: (inboxItem && inboxItem.profile_id) || state.profileId,
           type,
           amount: parseCOP(get('amount').value),
-          transaction_date: get('date').value || todayISO(),
+          transaction_date: (inboxItem && alertDay) || get('date').value || todayISO(),
           category_id: categoryId,
           subcategory_id: subId,
           goal_id: saving ? (get('goal_id').value || null) : null,
@@ -1617,8 +1858,14 @@ function txSheet(tx, inboxItem) {
             }
           } else if (inboxItem) {
             // Movimiento + fila applied en una sola transacción (finance_inbox_apply).
+            // La RPC fija source, source_message_id, el texto del correo y occurred_at.
             await Finance.applyInbox(inboxItem.id, payload);
             await applyGoal(payload.goal_id, goalDelta(payload));
+          } else if (interceptManualDuplicate(payload, {
+            close,
+            okText: saving ? 'Ahorro registrado' : 'Movimiento guardado',
+          })) {
+            return;
           } else {
             await Finance.addTransaction(payload);
             await applyGoal(payload.goal_id, goalDelta(payload));
@@ -1668,6 +1915,10 @@ function goalMoveSheet(goal, dir) {
           occurred_at: new Date().toISOString(),
         };
         try {
+          if (interceptManualDuplicate(payload, {
+            close,
+            okText: deposit ? 'Ahorro ingresado 🐖' : 'Retiro registrado',
+          })) return;
           await Finance.addTransaction(payload);
           await applyGoal(goal.id, goalDelta(payload));
           close();
@@ -1960,6 +2211,7 @@ function wire() {
     if (act === 'free-detail') return freeSheet();
     if (act === 'reconcile') return reconcileSheet();
     if (act === 'inbox') return inboxSheet();
+    if (act === 'dupes') return dupesSheet();
 
     if (act === 'base') {
       return simpleSheet({

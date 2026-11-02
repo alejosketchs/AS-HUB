@@ -371,6 +371,10 @@ button.finBox:active{transform:translate(2px,2px)}
 .finLine span small{font:650 11px var(--sans);color:var(--fn-mute)}
 .finLine.is-incomplete{background:var(--fn-pink-soft);border-left:4px solid var(--fn-pink);padding-left:8px}
 .finLine span small.finMissing{color:var(--fn-red);font-weight:800}
+.finDupe{display:grid;gap:8px;margin:0 0 12px;padding:12px;border:3px solid var(--fn-ink);background:var(--fn-peach)}
+.finDupe b{display:block;font:800 14px var(--sans)}
+.finDupe small{display:block;margin-top:2px;font:650 12px/1.4 var(--sans);color:var(--fn-mute)}
+.finDupeActs{display:flex;flex-wrap:wrap;gap:8px}
 .finDebtNext{margin-top:6px;font:650 12px var(--sans);color:#3c3c34}
 .finDebtNext b{display:inline;margin:0;font:800 12px var(--mono)}
 .finRhythm{display:grid;gap:12px}
